@@ -94,3 +94,47 @@ test("ensureParentDir creates missing parent directories", () => {
   ensureParentDir(target);
   assert.ok(fs.existsSync(path.dirname(target)));
 });
+
+test("a bound experiment resolves into its own folder and ignores legacy files", () => {
+  const dir = freshDir();
+  const expDir = path.join(dir, AUTO_DIR, "experiments", "parser-speed");
+
+  assert.equal(sessionFilePath(dir, "log", "parser-speed"), path.join(expDir, "log.jsonl"));
+  assert.equal(sessionFilePath(dir, "prompt", "parser-speed"), path.join(expDir, "prompt.md"));
+  assert.equal(sessionFilePath(dir, "measure", "parser-speed"), path.join(expDir, "measure.sh"));
+  assert.equal(
+    hookScriptPath(dir, "after", "parser-speed"),
+    path.join(expDir, "hooks", "after.sh"),
+  );
+
+  // A legacy flat log belongs to whatever unbound session wrote it and must
+  // never be handed to a bound experiment.
+  fs.writeFileSync(path.join(dir, "autoresearch.jsonl"), "{}\n");
+  assert.equal(sessionFilePath(dir, "log", "parser-speed"), path.join(expDir, "log.jsonl"));
+});
+
+test("two experiments in one repository never resolve to the same file", () => {
+  const dir = freshDir();
+  for (const kind of ["log", "prompt", "ideas", "checks", "measure", "config"]) {
+    assert.notEqual(
+      sessionFilePath(dir, kind, "alpha"),
+      sessionFilePath(dir, kind, "beta"),
+      `${kind} collides between experiments`,
+    );
+  }
+});
+
+test("an unbound session keeps the pre-experiment flat layout verbatim", () => {
+  // The legacy fallback is per file: a legacy log is honoured while a kind
+  // with no legacy file still resolves to the current layout. This matches the
+  // behaviour from before experiments existed.
+  const dir = freshDir();
+  fs.writeFileSync(path.join(dir, "autoresearch.jsonl"), "{}\n");
+
+  assert.equal(sessionFilePath(dir, "log"), path.join(dir, "autoresearch.jsonl"));
+  assert.equal(sessionFilePath(dir, "prompt"), path.join(dir, AUTO_DIR, "prompt.md"));
+  assert.equal(sessionFilePath(dir, "measure"), path.join(dir, AUTO_DIR, "measure.sh"));
+
+  fs.writeFileSync(path.join(dir, "autoresearch.md"), "");
+  assert.equal(sessionFilePath(dir, "prompt"), path.join(dir, "autoresearch.md"));
+});

@@ -11,6 +11,7 @@ import autoresearchExtension, {
 } from "../extensions/pi-autoresearch/index.ts";
 
 const ACTIVATION_ENTRY = "pi-autoresearch.activation";
+const BINDING_ENTRY = "pi-autoresearch.binding";
 const AUTORESEARCH_TOOLS = ["init_experiment", "log_experiment", "run_experiment"];
 
 function createHarness({ cwd, branch = [], initialActiveTools = [] }) {
@@ -316,10 +317,13 @@ test("starting autoresearch binds redirected workingDir activation to the pi ses
     await harness.commands.get("autoresearch").handler("optimize runtime", harness.ctx);
 
     assert.deepEqual(harness.activeTools().sort(), AUTORESEARCH_TOOLS.sort());
-    assert.equal(harness.appendedEntries.length, 1);
-    assert.equal(harness.appendedEntries[0].customType, ACTIVATION_ENTRY);
-    assert.equal(harness.appendedEntries[0].data.active, true);
-    assert.equal(harness.appendedEntries[0].data.workDir, await realpath(workDir));
+    // Entering the loop first claims an experiment, then records the activation.
+    assert.equal(harness.appendedEntries.length, 2);
+    assert.equal(harness.appendedEntries[0].customType, BINDING_ENTRY);
+    assert.equal(typeof harness.appendedEntries[0].data.experimentId, "string");
+    assert.equal(harness.appendedEntries[1].customType, ACTIVATION_ENTRY);
+    assert.equal(harness.appendedEntries[1].data.active, true);
+    assert.equal(harness.appendedEntries[1].data.workDir, await realpath(workDir));
     assert.equal(harness.sentMessages.length, 1);
   } finally {
     await rm(cwd, { recursive: true, force: true });
