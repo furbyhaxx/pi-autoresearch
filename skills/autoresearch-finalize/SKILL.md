@@ -10,8 +10,8 @@ Turn a noisy autoresearch branch into clean, independent branches — one per lo
 
 ## Step 1 — Analyze and Propose Groups
 
-1. Read `.auto/log.jsonl` (legacy: `autoresearch.jsonl`). Filter to **kept** experiments only.
-2. Read `.auto/prompt.md` (legacy: `autoresearch.md`) for context.
+1. Read this experiment's `log.jsonl` — the path is in your system prompt, and looks like `.auto/experiments/<id>/log.jsonl`. Filter to **kept** experiments only. Never read another experiment's log in the same repository.
+2. Read this experiment's `prompt.md` for context.
 3. Expand all short commit hashes to full hashes: `git rev-parse <short_hash>`
 4. Get the merge-base: `git merge-base HEAD main`
 5. For each kept commit, get the diff stat (use `$BASE..<commit>` for the first, `<prev_kept>..<commit>` for subsequent).
@@ -21,6 +21,8 @@ Turn a noisy autoresearch branch into clean, independent branches — one per lo
    - **Watch for cross-file dependencies.** Each branch is independent, so if group 1 adds an API in `api.js` and group 2 calls it in `parser.js`, group 2's branch won't work in isolation. When proposing groups, flag dependencies: "group 2 depends on group 1 — review together." If the dependency is tight, merge the groups.
    - **Keep each group small and focused.** One idea, one theme per group.
    - **Don't hardcode a count.** Could be 2, could be 15.
+
+> In worktree mode the experiment already sits on its own branch (`autoresearch/<id>`) and this is its final state. Run the script from inside that worktree; the state folder stays in the main worktree.
 
 Present the proposed grouping to the user:
 
@@ -69,7 +71,7 @@ Then run:
 bash <SKILL_DIR>/finalize.sh /tmp/groups.json
 ```
 
-The script creates one branch per group from the merge-base, verifies the union matches the original branch, and prints a summary with all branches, cleanup commands, and any ideas from `.auto/ideas.md` (legacy: `autoresearch.ideas.md`).
+The script creates one branch per group from the merge-base, verifies the union matches the original branch, and prints a summary with all branches, cleanup commands, and any ideas from this experiment's `ideas.md`. Pass `"ideas_file"` in the JSON when the path is known.
 
 On creation failure: rolls back (deletes branches, restores original branch, pops stash).
 On verification failure: exits non-zero but leaves branches intact for inspection.

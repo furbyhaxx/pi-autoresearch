@@ -11,6 +11,7 @@ set -euo pipefail
 #   "trunk": "main",
 #   "final_tree": "<full HEAD hash of autoresearch branch>",
 #   "goal": "short-slug",
+#   "ideas_file": "<optional path to this experiment's ideas.md>",
 #   "groups": [
 #     {
 #       "title": "Switch to forks pool",
@@ -70,6 +71,7 @@ fs.writeFileSync(outDir + '/trunk', config.trunk || 'main');
 fs.writeFileSync(outDir + '/final_tree', config.final_tree);
 fs.writeFileSync(outDir + '/goal', config.goal);
 fs.writeFileSync(outDir + '/count', String(config.groups.length));
+if (config.ideas_file) fs.writeFileSync(outDir + '/ideas_file', config.ideas_file);
 config.groups.forEach((group, idx) => {
   fs.writeFileSync(outDir + '/' + idx + '.title', group.title);
   fs.writeFileSync(outDir + '/' + idx + '.body', group.body);
@@ -408,10 +410,27 @@ print_summary() {
   echo "  rm -r .auto    # session folder (current layout)"
   echo "  rm -f autoresearch.jsonl autoresearch.sh autoresearch.md autoresearch.ideas.md    # legacy flat files, if any"
 
+  # Prefer an explicit path from groups.json; otherwise accept the per-experiment
+  # layout, the pre-experiment layout, and the legacy flat file.
   local ideas_file=""
-  if [ -f ".auto/ideas.md" ]; then
+  local declared_ideas=""
+  if [ -f "$DATA_DIR/ideas_file" ]; then
+    declared_ideas=$(cat "$DATA_DIR/ideas_file")
+  fi
+  if [ -n "$declared_ideas" ] && [ -f "$declared_ideas" ]; then
+    ideas_file="$declared_ideas"
+  elif [ -f ".auto/ideas.md" ]; then
     ideas_file=".auto/ideas.md"
-  elif [ -f "autoresearch.ideas.md" ]; then
+  else
+    # A repository can hold several experiments; take the one with a backlog.
+    for candidate in .auto/experiments/*/ideas.md; do
+      if [ -f "$candidate" ]; then
+        ideas_file="$candidate"
+        break
+      fi
+    done
+  fi
+  if [ -z "$ideas_file" ] && [ -f "autoresearch.ideas.md" ]; then
     ideas_file="autoresearch.ideas.md"
   fi
   if [ -n "$ideas_file" ]; then

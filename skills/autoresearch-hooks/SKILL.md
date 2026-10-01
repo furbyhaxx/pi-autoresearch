@@ -8,10 +8,12 @@ description: Author pre/post-iteration hooks for an autoresearch session. Use wh
 Optional scripts that run at iteration boundaries in an autoresearch session. Two hooks, both transparent to the loop-running agent — their effect is a file on disk or a steer message.
 
 ```
-.auto/hooks/
+.auto/experiments/<id>/hooks/
   before.sh    # fires before each iteration (prospective)
   after.sh     # fires after each log_experiment (retrospective)
 ```
+
+`<id>` is this experiment's id, given in your system prompt. Hooks are per experiment: another experiment running in the same repository has its own pair.
 
 Both files are optional. Files without the executable bit are silently ignored.
 
@@ -100,7 +102,7 @@ One JSON line. Parse with `jq`. Realistic example:
 
 ### Preservation
 
-`.auto/**` survives the auto-revert — the entire `.auto/` folder is preserved. (Legacy `autoresearch.*` paths are still preserved too, for in-flight sessions.)
+`.auto/**` survives the auto-revert — the entire `.auto/` folder is preserved, including this experiment's state and every other experiment's. (Legacy `autoresearch.*` paths are still preserved too, for in-flight sessions.)
 
 ---
 

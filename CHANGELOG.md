@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Concurrent experiments in one repository.** Each experiment now owns an id and a private state folder, `.auto/experiments/<id>/`, holding its `log.jsonl`, `prompt.md`, `measure.sh`, `checks.sh`, `ideas.md`, `config.json` and `hooks/`. Previously all of these were single slots at `.auto/`, so a second session in the same codebase overwrote the first one's log, config and hook scripts, and both sessions reconstructed their state from the same merged file.
+- A registry at `.auto/experiments.json` tracks every experiment in the repository. It lives in the *main* worktree, so a session running inside a linked worktree still finds it.
+- Per-session binding, recorded in the session transcript and keyed by registry root. A session that has not claimed an experiment gets its own on first use; `shouldAutoActivateAutoresearch` now matches the activation decision per experiment instead of per working directory, so one session's `/autoresearch off` no longer silences another's.
+- `/autoresearch new <name>` creates an experiment in a dedicated git worktree on branch `autoresearch/<id>`, and prints the `cd … && pi` line needed to start it. A session launched inside a worktree adopts that experiment with no further command.
+- `/autoresearch new <name> --shared` creates an experiment in the current checkout; `/autoresearch list` shows them all with `*` marking the current session's; `/autoresearch join <id>` rebinds; `/autoresearch drop <id>` removes an experiment, its state and its worktree.
+- Hook payloads gained `experiment` and `state_root`, and the compaction summary is built from the bound experiment's paths.
+
+### Changed
+
+- **Git operations in a shared working tree are now scoped instead of repository-wide.** `log_experiment` no longer runs `git add -A` or `git checkout -- .` when other experiments are live in the same checkout: `keep` stages only the files this experiment changed, and `discard` restores only those files. A discard is refused when another experiment moved `HEAD` in the meantime, since the experiment's diff no longer has a meaningful baseline. Mutations are serialized across processes by a lockfile at `.auto/git.lock` that breaks itself if the owning process died.
+- The first result of an experiment in a shared checkout is never committed or reverted automatically. With no prior record of which changes belong to which experiment, the two are indistinguishable and guessing would destroy a sibling's work. The measurement is still logged and the agent is told to stage or revert by hand, or to move to a worktree.
+- A sole experiment in a repository is unaffected: shared mode with no siblings keeps the original repository-wide commit and revert behaviour.
+- `isAutoresearchShCommand` accepts the per-experiment `measure.sh` path, so the benchmark gate still fires once state moved under `.auto/experiments/<id>/`.
+- `finalize.sh` accepts an optional `ideas_file` and finds the backlog under `.auto/experiments/*/ideas.md`.
+
+### Fixed
+
+- `stopDashboardServer()` ran on every session's shutdown, so one session exiting killed the export dashboard another session in the same process was streaming from. The server is now tagged with its owning session and only that session tears it down. The fullscreen overlay and its spinner interval had the same problem and are now tagged too.
+- The export dashboard served a single fixed `log.jsonl` route; it now serves the bound experiment's log.
+- Experiment names and metrics are read per experiment, so a session no longer picks up the name and metric of a sibling experiment's config header.
+
 ## [1.8.1] - 2026-09-08
 
 ### Fixed

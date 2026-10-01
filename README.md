@@ -54,9 +54,14 @@ Then start the loop inside pi:
 | Subcommand | Description |
 |------------|-------------|
 | `/autoresearch` | Show help without activating autoresearch mode. |
-| `/autoresearch <text>` | Enter autoresearch mode. If `.auto/prompt.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
-| `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps `.auto/log.jsonl` intact. |
-| `/autoresearch clear` | Delete `.auto/log.jsonl`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
+| `/autoresearch <text>` | Enter autoresearch mode. If this experiment's `prompt.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
+| `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps the log intact. |
+| `/autoresearch clear` | Delete this experiment's `log.jsonl`, reset its state, and turn autoresearch mode off. Use this for a clean start. |
+| `/autoresearch list` | List every experiment in this repository; `*` marks the one this session is bound to. |
+| `/autoresearch new <name>` | Create an experiment in its own git worktree — full isolation. Prints the `cd … && pi` line to start it. |
+| `/autoresearch new <name> --shared` | Create one in the current checkout, with git operations scoped to this experiment's files. |
+| `/autoresearch join <id>` | Bind this session to an existing experiment. |
+| `/autoresearch drop <id>` | Remove an experiment, its state, and its worktree. |
 | `/autoresearch export` | Open a live dashboard in your browser. Auto-updates as experiments run. |
 | `/autoresearch dashboard` | Open the fullscreen scrollable dashboard overlay in the terminal. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
 
@@ -65,6 +70,8 @@ Then start the loop inside pi:
 ```
 /autoresearch optimize unit test runtime, monitor correctness
 /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target
+/autoresearch list
+/autoresearch new parser-speed
 /autoresearch export
 /autoresearch dashboard
 /autoresearch off
@@ -133,17 +140,55 @@ extension binds nothing by default.
 
 **`autoresearch-finalize`** turns a noisy autoresearch branch into clean, independent branches — one per logical change, each starting from the merge-base. Groups must not share files, so each branch can be reviewed and merged independently.
 
-**`autoresearch-hooks`** *(optional)* helps author `.auto/hooks/before.sh` and `.auto/hooks/after.sh` for a session. It ships with ten reference scripts in [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples/) (external search, learnings journal, native notifications, anti-thrash, idea rotation, and more) — the skill handles the contract, you pick the inspiration. The core autoresearch loop has no hook awareness.
+**`autoresearch-hooks`** *(optional)* helps author `hooks/before.sh` and `hooks/after.sh` for a session. It ships with ten reference scripts in [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples/) (external search, learnings journal, native notifications, anti-thrash, idea rotation, and more) — the skill handles the contract, you pick the inspiration. The core autoresearch loop has no hook awareness.
 
-All session files live in a single `.auto/` subfolder at the working-directory root — one folder to preserve across reverts, gitignore, and clean up. (Legacy flat `autoresearch.*` files are still read for in-flight sessions.)
+## Running several experiments at once
+
+One repository can host many independent experiments — one pi session each. Every experiment gets an id and a private state folder, so logs, prompts, hooks and configs never collide.
+
+```
+.auto/
+  experiments.json            # registry of every experiment in this repo
+  experiments/<id>/           # one experiment's state
+  worktrees/<id>/             # git worktree, for worktree-mode experiments
+```
+
+**Give each experiment its own worktree.** This is the only setup where two agents can truly work without touching each other:
+
+```
+/autoresearch new parser-speed
+# → creates .auto/worktrees/parser-speed on branch autoresearch/parser-speed
+cd .auto/worktrees/parser-speed && pi
+```
+
+A session started inside a worktree binds itself to that experiment — no further command. Its commits and reverts happen in that worktree, so the sibling experiment is physically unreachable from them.
+
+**Shared mode** keeps the experiment in the checkout you are already in:
+
+```
+/autoresearch new render-cache --shared
+```
+
+Here the git layer is conservative, because a working tree shared by two agents cannot attribute a file change to one of them:
+
+- `keep` stages only the files this experiment changed — never `git add -A`, which would sweep up a sibling's in-flight work.
+- `discard` restores only this experiment's files, and is **refused** if another experiment moved `HEAD` in the meantime.
+- The **first** result in a shared checkout is never committed or reverted for you: with no prior record of which changes are yours, guessing would risk another session's work. The measurement is still logged; you stage or revert by hand, or move the experiment to a worktree.
+- Files another experiment has already claimed are left alone and reported.
+
+Sole experiment in a repository? Shared mode behaves exactly as it always has — full repository operations, nothing to protect.
+
+State files, one per experiment:
 
 | File | Purpose |
 |------|---------|
-| `.auto/prompt.md` | Session document — objective, metrics, files in scope, what's been tried. A fresh agent can resume from this alone. |
-| `.auto/measure.sh` | Benchmark script — pre-checks, runs the workload, outputs `METRIC name=number` lines. |
-| `.auto/log.jsonl` | Append-only log of every run (written by the tools). |
-| `.auto/checks.sh` | *(optional)* Backpressure checks — tests, types, lint. Runs after each passing benchmark. Failures block `keep`. |
-| `.auto/hooks/` | *(optional)* Executable scripts (`before.sh`, `after.sh`) that fire around iterations. Stdout is delivered to the agent as a steer message. |
+| `experiments/<id>/prompt.md` | Session document — objective, metrics, files in scope, what's been tried. A fresh agent can resume from this alone. |
+| `experiments/<id>/measure.sh` | Benchmark script — pre-checks, runs the workload, outputs `METRIC name=number` lines. |
+| `experiments/<id>/log.jsonl` | Append-only log of every run (written by the tools). |
+| `experiments/<id>/checks.sh` | *(optional)* Backpressure checks — tests, types, lint. Runs after each passing benchmark. Failures block `keep`. |
+| `experiments/<id>/hooks/` | *(optional)* Executable scripts (`before.sh`, `after.sh`) that fire around iterations. Stdout is delivered to the agent as a steer message. |
+
+Gitignore `.auto/` as before. Legacy flat `autoresearch.*` files and the pre-experiment flat `.auto/` layout are still read for in-flight sessions.
 
 ---
 
@@ -175,20 +220,20 @@ Then `/reload` in pi.
 /autoresearch optimize unit test runtime, monitor correctness
 ```
 
-This activates autoresearch mode and makes the experiment tools available. If `.auto/prompt.md` does not exist, it also loads the `autoresearch-create` skill. Calling `/skill:autoresearch-create` directly does not activate the mode, so the tools remain unavailable in a fresh session.
+This activates autoresearch mode and makes the experiment tools available. If this experiment's `prompt.md` does not exist, it also loads the `autoresearch-create` skill. Calling `/skill:autoresearch-create` directly does not activate the mode, so the tools remain unavailable in a fresh session.
 
-The agent asks about your goal, command, metric, and files in scope — or infers them from context. It then creates a branch, writes `.auto/prompt.md` and `.auto/measure.sh`, runs the baseline, and starts looping immediately.
+The agent asks about your goal, command, metric, and files in scope — or infers them from context. It then creates a branch, writes `prompt.md` and `measure.sh` in the experiment's state folder, runs the baseline, and starts looping immediately.
 
 ### 2. The loop
 
 The agent runs autonomously: edit → commit → `run_experiment` → `log_experiment` → keep or revert → repeat. It never stops unless interrupted.
 
-Every result is appended to `.auto/log.jsonl` in your project — one line per run. This means:
+Every result is appended to the experiment's `log.jsonl` — one line per run. This means:
 
 - **Survives restarts** — the agent can resume a session by reading the file
-- **Survives context resets** — `.auto/prompt.md` captures what's been tried so a fresh agent has full context
+- **Survives context resets** — `prompt.md` captures what's been tried so a fresh agent has full context
 - **Human readable** — open it anytime to see the full history
-- **Branch-aware** — each branch has its own session
+- **Branch-aware** — each branch and each worktree has its own experiment
 
 ### 3. Finalize into reviewable branches
 
@@ -196,7 +241,7 @@ Every result is appended to `.auto/log.jsonl` in your project — one line per r
 /skill:autoresearch-finalize
 ```
 
-The agent reads `.auto/log.jsonl`, groups kept experiments into logical changesets, proposes the grouping for your approval, then creates independent branches from the merge-base. Each commit includes metric improvements in the message. Groups must not share files, so branches can be reviewed and merged independently.
+The agent reads this experiment's `log.jsonl`, groups kept experiments into logical changesets, proposes the grouping for your approval, then creates independent branches from the merge-base. Each commit includes metric improvements in the message. Groups must not share files, so branches can be reviewed and merged independently.
 
 ### 4. Monitor progress
 
@@ -237,8 +282,8 @@ The **extension** is domain-agnostic infrastructure. The **skill** encodes domai
 Two files keep the session alive across restarts and context resets:
 
 ```
-.auto/log.jsonl   — append-only log of every run (metric, status, commit, description)
-.auto/prompt.md   — living document: objective, what's been tried, dead ends, key wins
+.auto/experiments/<id>/log.jsonl   — append-only log of every run (metric, status, commit, description)
+.auto/experiments/<id>/prompt.md   — living document: objective, what's been tried, dead ends, key wins
 ```
 
 A fresh agent with no memory can read these two files and continue exactly where the previous session left off.
@@ -263,7 +308,7 @@ Create `.auto/config.json` in your pi session directory to customize behavior:
 
 ### Long-running loops and context
 
-The loop is designed to run unattended across context limits. When pi's [auto-compaction](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/compaction.md) summarizes the older portion of the conversation, autoresearch detects the resulting idle and re-prompts the agent to re-read `.auto/prompt.md`, the tail of `.auto/log.jsonl`, `.auto/ideas.md`, and `git log` before continuing. All progress is persisted in those files, so the post-summary turn rehydrates from the source of truth instead of relying on whatever survived compaction. No tuning required — if pi's auto-compaction is enabled (the default), this just works.
+The loop is designed to run unattended across context limits. When pi's [auto-compaction](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/compaction.md) summarizes the older portion of the conversation, autoresearch detects the resulting idle and re-prompts the agent to re-read its `prompt.md`, the tail of `log.jsonl`, `ideas.md`, and `git log` before continuing. All progress is persisted in those files, so the post-summary turn rehydrates from the source of truth instead of relying on whatever survived compaction. No tuning required — if pi's auto-compaction is enabled (the default), this just works.
 
 ---
 
@@ -276,7 +321,7 @@ After 3+ experiments in a session, pi-autoresearch computes a **confidence score
 - Uses [Median Absolute Deviation (MAD)](https://en.wikipedia.org/wiki/Median_absolute_deviation) of all metric values in the current segment as a robust noise estimator.
 - Confidence = `|best_improvement| / MAD`. A score of 2.0× means the best improvement is twice the noise floor.
 - Shown in the widget, fullscreen dashboard, and `log_experiment` output.
-- Persisted to `.auto/log.jsonl` on each result for post-hoc analysis.
+- Persisted to the experiment's `log.jsonl` on each result for post-hoc analysis.
 - **Advisory only** — never auto-discards. The agent is guided to re-run experiments when confidence is low, but the final keep/discard decision stays with the agent.
 
 | Confidence | Color | Meaning |
@@ -322,7 +367,7 @@ Drop executable scripts in `.auto/hooks/` to run code at iteration boundaries. H
 - **Stdin** — a JSON object on a single line. Shape depends on the stage (see below). Extract fields with `jq`.
 - **Stdout** is delivered to the agent as a steer message (capped at 8 KB). Empty stdout = silent.
 - Non-zero exit or >30s timeout surfaces an error steer to the agent.
-- Each fire appends a `{"type":"hook",…}` entry to `.auto/log.jsonl` for observability.
+- Each fire appends a `{"type":"hook",…}` entry to the experiment's `log.jsonl` for observability.
 
 **`before.sh` stdin** (on fresh activation `last_run` is `null`):
 
@@ -374,7 +419,7 @@ Drop executable scripts in `.auto/hooks/` to run code at iteration boundaries. H
 
 Pi packages run with your full user permissions. Review this repository before installing it, and run autoresearch in a dedicated branch or worktree with a clean working tree.
 
-Autoresearch intentionally edits files, creates and reverts commits, and executes the commands in `.auto/measure.sh`, `.auto/checks.sh`, and `.auto/hooks/`. Treat those files as executable code: review them before each session, keep credentials and sensitive files out of scope, and use a sandbox or restricted environment for untrusted projects.
+Autoresearch intentionally edits files, creates and reverts commits, and executes the commands in the experiment's `measure.sh`, `checks.sh`, and `hooks/`. Treat those files as executable code: review them before each session, keep credentials and sensitive files out of scope, and use a sandbox or restricted environment for untrusted projects.
 
 For reproducible installs, pin a version you have reviewed, for example `pi install npm:pi-autoresearch@1.7.0`. Published npm releases include provenance attestations.
 

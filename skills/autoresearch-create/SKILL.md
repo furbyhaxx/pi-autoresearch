@@ -15,29 +15,48 @@ Autonomous experiment loop: try ideas, keep what works, discard what doesn't, ne
 
 ## Session files
 
-All session files live in a single `.auto/` subfolder at the working directory root. This keeps everything in one place — easy to preserve across reverts, gitignore, and clean up.
+All session files live under a single `.auto/` subfolder. This keeps everything in one place — easy to preserve across reverts, gitignore, and clean up.
 
-| File | Purpose |
-|------|---------|
-| `.auto/prompt.md` | Experiment prompt / playbook (heart of the session) |
-| `.auto/measure.sh` | Benchmark script — emits `METRIC name=value` lines |
-| `.auto/log.jsonl` | Append-only result log (written by the tools) |
-| `.auto/ideas.md` | Ideas backlog (optional) |
-| `.auto/checks.sh` | Correctness checks (optional) |
-| `.auto/config.json` | Session config (optional) |
-| `.auto/hooks/{before,after}.sh` | Lifecycle hooks (optional) |
+Each experiment owns a private folder inside it, so several experiments can run in one repository at the same time without touching each other's state:
 
-> Always create files in the `.auto/` layout. Legacy flat `autoresearch.*` files are still read for in-flight sessions, but new sessions should use `.auto/`.
+```
+.auto/
+  experiments.json                  # registry of every experiment in this repo
+  experiments/<id>/                 # one experiment's state
+    prompt.md                       # Experiment prompt / playbook (heart of the session)
+    measure.sh                      # Benchmark script — emits `METRIC name=value` lines
+    log.jsonl                       # Append-only result log (written by the tools)
+    ideas.md                        # Ideas backlog (optional)
+    checks.sh                       # Correctness checks (optional)
+    config.json                     # Session config (optional)
+    hooks/{before,after}.sh         # Lifecycle hooks (optional)
+  worktrees/<id>/                   # git worktree, for worktree-mode experiments
+```
+
+**Write to the exact paths your system prompt gives you.** It states this experiment's id and the absolute path of its `prompt.md` and `ideas.md`. Do not guess `.auto/` — another experiment may be running there, and writing to the wrong folder silently corrupts its state.
+
+> Legacy flat `autoresearch.*` files and a pre-experiment flat `.auto/` layout are still read for in-flight sessions, but every new session writes to `.auto/experiments/<id>/`.
+
+## Running alongside another experiment
+
+Your system prompt tells you which mode you are in.
+
+**Worktree mode** (`/autoresearch new <name>`) — you own a whole git worktree on your own branch. Commits and discards are yours alone, and no other experiment can be affected by them. Nothing extra to do.
+
+**Shared mode** (a checkout with other experiments in it) — commit and revert are scoped to the files this experiment actually changed, never `git add -A`. Two consequences:
+
+- Only edit files this experiment owns. If another experiment is working in the same checkout, keep to your own area of the codebase.
+- The **first** result in a shared checkout is not committed or reverted for you: with no prior record of which changes are yours, guessing would risk another session's work. You will be told, and you can stage or revert by hand — or move the experiment to a worktree with `/autoresearch new <name>`.
 
 ## Setup
 
 1. Ask (or infer): **Goal**, **Command**, **Metric** (+ direction), **Files in scope**, **Constraints**.
-2. `git checkout -b autoresearch/<goal>-<date>`
+2. In worktree mode a branch already exists (`autoresearch/<id>`) — do not create another. Otherwise `git checkout -b autoresearch/<goal>-<date>`.
 3. Read the source files. Understand the workload deeply before writing anything.
-4. `mkdir -p .auto`, then write `.auto/prompt.md` and `.auto/measure.sh` (see below). Commit both.
+4. `mkdir -p` the experiment folder given in your system prompt, then write `prompt.md` and `measure.sh` there (see below). Commit both.
 5. `init_experiment` → run baseline → `log_experiment` → start looping immediately.
 
-### `.auto/prompt.md`
+### `prompt.md`
 
 This is the heart of the session. A fresh agent with no context should be able to read this file and run the loop effectively. Invest time making it excellent.
 
@@ -52,7 +71,9 @@ This is the heart of the session. A fresh agent with no context should be able t
 - **Secondary**: <name>, <name>, ... — independent tradeoff monitors
 
 ## How to Run
-`./.auto/measure.sh` — outputs `METRIC name=number` lines.
+Your system prompt gives this experiment's benchmark as an **absolute path**. Use it verbatim —
+it emits `METRIC name=number` lines. A relative path does not resolve, because the state
+folder lives in the main worktree while commands run in the experiment's code directory.
 
 ## Files in Scope
 <Every file the agent may modify, with a brief note on what it does.>
@@ -68,9 +89,9 @@ This is the heart of the session. A fresh agent with no context should be able t
 insights, and discarded ideas: why they failed and what would justify revisiting them.>
 ```
 
-Update `.auto/prompt.md` periodically — especially the "What's Been Tried" section — so resuming agents have full context.
+Update this experiment's `prompt.md` periodically — especially the "What's Been Tried" section — so resuming agents have full context.
 
-### `.auto/measure.sh`
+### `measure.sh`
 
 Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), runs the benchmark, and outputs structured lines to stdout. Keep the script fast — every second is multiplied by hundreds of runs.
 
@@ -95,9 +116,9 @@ The script runs the same code every iteration — but you can **update it during
 
 Use `log_experiment`'s `asi` parameter to annotate each run with **whatever would help the next iteration make a better decision.** Free-form key/value pairs — you decide what's worth recording. Don't repeat the description or raw output; capture what you'd lose after a context reset.
 
-**Annotate failures and crashes heavily.** Discarded and crashed runs are reverted — the code changes are gone. The only record that survives is the description and ASI in `.auto/log.jsonl`. If you don't capture what you tried and why it failed, future iterations will waste time re-discovering the same dead ends.
+**Annotate failures and crashes heavily.** Discarded and crashed runs are reverted — the code changes are gone. The only record that survives is the description and ASI in this experiment's `log.jsonl`. If you don't capture what you tried and why it failed, future iterations will waste time re-discovering the same dead ends.
 
-### `.auto/config.json` (optional)
+### `config.json` (optional)
 
 JSON config file that lives in `.auto/` under the pi session's working directory (`ctx.cwd`). Supported fields:
 
@@ -111,7 +132,7 @@ JSON config file that lives in `.auto/` under the pi session's working directory
 }
 ```
 
-### `.auto/checks.sh` (optional)
+### `checks.sh` (optional)
 
 Bash script (`set -euo pipefail`) for backpressure/correctness checks: tests, types, lint, etc. **Only create this file when the user's constraints require correctness validation** (e.g., "tests must pass", "types must check").
 
@@ -145,15 +166,15 @@ pnpm typecheck 2>&1 | grep -i error || true
 - **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on. Don't over-invest.
 - **Think longer when stuck.** Re-read source files, study the profiling data, reason about what the CPU is actually doing. The best ideas come from deep understanding, not from trying random variations.
-- **Resuming:** if `.auto/prompt.md` exists, read it + git log, continue looping.
+- **Resuming:** if this experiment's `prompt.md` exists, read it + git log, continue looping.
 
 **NEVER STOP.** The user may be away for hours. Keep going until interrupted.
 
 ## Ideas Backlog
 
-When you discover complex but promising optimizations that you won't pursue right now, **append them as bullets to `.auto/ideas.md`**. Don't let good ideas get lost.
+When you discover complex but promising optimizations that you won't pursue right now, **append them as bullets to this experiment's `ideas.md`**. Don't let good ideas get lost.
 
-On resume (context limit, crash), check `.auto/ideas.md` — prune stale/tried entries, experiment with the rest. When all paths are exhausted, delete the file and write a final summary.
+On resume (context limit, crash), check `ideas.md` — prune stale/tried entries, experiment with the rest. When all paths are exhausted, delete the file and write a final summary.
 
 ## User Messages During Experiments
 
