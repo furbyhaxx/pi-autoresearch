@@ -44,6 +44,7 @@ import {
 import {
   parseJsonlEntry,
   isAutoresearchRunEntry,
+  entryBelongsToExperiment,
   extractAutoresearchSessionName,
   reconstructJsonlState,
 } from "./jsonl.ts";
@@ -53,6 +54,34 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts, SHORTCUT_ACTIONS } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import {
+  branchFor,
+  concurrentExperiments,
+  createExperiment,
+  createWorktree,
+  deleteExperiment,
+  experimentDir,
+  findExperimentByWorkDir,
+  getExperiment,
+  gitLockPath,
+  listExperiments,
+  readRegistry,
+  removeWorktree,
+  resolveRegistryRoot,
+  uniqueId,
+  updateExperiment,
+  type ExperimentRecord,
+} from "./experiments.ts";
+import {
+  claimedBy,
+  dirtyEntries,
+  dirtyPaths,
+  headSha,
+  scopedCommit,
+  scopedRevert,
+  withGitLock,
+  type GitRunner,
+} from "./git.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -170,6 +199,7 @@ interface RunDetails {
 }
 
 interface LogDetails {
+  experimentId: string | null;
   experiment: ExperimentResult;
   state: ExperimentState;
   wallClockSeconds: number | null;
@@ -187,6 +217,10 @@ interface AutoresearchRuntime {
   pendingResumeTimer: ReturnType<typeof setTimeout> | null;
   /** Resume message to send when the pending timer fires. */
   pendingResumeMessage: string | null;
+  /** Experiment this session is bound to, or null before first use. */
+  experimentId: string | null;
+  /** Main worktree that holds the registry and every `.auto/` state file. */
+  stateRoot: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +408,7 @@ function killTree(pid: number): void {
  * pattern. Rejects chaining tricks like "evil.py; measure.sh" because we require
  * the benchmark script to be the *first* real command.
  */
-function isAutoresearchShCommand(command: string): boolean {
+export function isAutoresearchShCommand(command: string): boolean {
   let cmd = command.trim();
 
   // Strip leading env variable assignments: FOO=bar BAZ="qux" ...
@@ -389,10 +423,19 @@ function isAutoresearchShCommand(command: string): boolean {
   } while (cmd !== prev);
 
   // Now the core command must be the benchmark script via a known invocation.
-  // Current layout requires the `.auto/measure.sh` path; legacy `autoresearch.sh`
-  // is still accepted for in-flight sessions. An optional path prefix allows
-  //   ./.auto/measure.sh, /abs/path/.auto/measure.sh, bash [-flags] autoresearch.sh, etc.
-  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\/|\.{1,2}\/|[\w.-]+\/)*(?:autoresearch\.sh|\.auto\/measure\.sh)(?:\s|$)/.test(cmd);
+  // Strip an interpreter, then require the first token to be the script itself
+  // inside an autoresearch location: `.auto/experiments/<id>/measure.sh` for the
+  // per-experiment layout, `.auto/measure.sh` for the pre-experiment one, and the
+  // legacy `autoresearch.sh` for in-flight sessions. A chaining trick like
+  // `evil.py; measure.sh` fails, because the script must come first.
+  const withoutInterpreter = cmd.replace(/^(?:bash|sh|source)\s+(?:-\w+\s+)*/, "");
+  const scriptPath = (withoutInterpreter.split(/\s+/)[0] ?? "").replace(/^(?:\.{1,2}\/)+/, "");
+
+  return (
+    /\.auto\/(?:experiments\/[\w.-]+\/)?measure\.sh$/.test(scriptPath) ||
+    scriptPath === "autoresearch.sh" ||
+    scriptPath.endsWith("/autoresearch.sh")
+  );
 }
 
 function isBetter(
@@ -467,9 +510,9 @@ interface AutoresearchConfig {
 }
 
 /** Read the config file (.auto/config.json, legacy autoresearch.config.json) from the given directory (always ctx.cwd) */
-function readConfig(cwd: string): AutoresearchConfig {
+function readConfig(cwd: string, experimentId: string | null = null): AutoresearchConfig {
   try {
-    const configPath = autoresearchConfigPath(cwd);
+    const configPath = autoresearchConfigPath(cwd, experimentId);
     if (!fs.existsSync(configPath)) return {};
     return JSON.parse(fs.readFileSync(configPath, "utf-8"));
   } catch {
@@ -478,8 +521,8 @@ function readConfig(cwd: string): AutoresearchConfig {
 }
 
 /** Read maxExperiments from the config file (if it exists) */
-function readMaxExperiments(cwd: string): number | null {
-  const config = readConfig(cwd);
+function readMaxExperiments(cwd: string, experimentId: string | null = null): number | null {
+  const config = readConfig(cwd, experimentId);
   return (typeof config.maxIterations === "number" && config.maxIterations > 0)
     ? Math.floor(config.maxIterations)
     : null;
@@ -511,10 +554,41 @@ function samePath(a: string, b: string): boolean {
 }
 
 const AUTORESEARCH_ACTIVATION_ENTRY = "pi-autoresearch.activation";
+const AUTORESEARCH_BINDING_ENTRY = "pi-autoresearch.binding";
+
+interface AutoresearchBindingEntryData {
+  version?: number;
+  root?: string;
+  experimentId?: string;
+}
+
+/**
+ * The experiment this session is bound to, replayed from the session's own
+ * entries. Scoped to the registry root so a session that moves repositories
+ * does not inherit a binding from somewhere else.
+ */
+function recordedBinding(ctx: ExtensionContext, stateRoot: string): string | null {
+  const root = canonicalPath(stateRoot);
+  let experimentId: string | null = null;
+
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (entry.type !== "custom") continue;
+    if (entry.customType !== AUTORESEARCH_BINDING_ENTRY) continue;
+
+    const data = entry.data as AutoresearchBindingEntryData | undefined;
+    if (!data || typeof data.experimentId !== "string") continue;
+    if (typeof data.root !== "string" || canonicalPath(data.root) !== root) continue;
+
+    experimentId = data.experimentId;
+  }
+
+  return experimentId;
+}
 
 interface AutoresearchActivationEntryData {
   version?: number;
   workDir?: string;
+  experimentId?: string | null;
   active?: boolean;
 }
 
@@ -542,7 +616,16 @@ function autoresearchActivationData(entry: CustomEntry): AutoresearchActivationE
   return data;
 }
 
-function recordedActivationDecision(ctx: ExtensionContext, workDir: string): boolean | null {
+/**
+ * Replay an explicit `/autoresearch on|off` from this session. Matched on the
+ * experiment as well as the directory: two experiments sharing a checkout each
+ * keep their own on/off state.
+ */
+function recordedActivationDecision(
+  ctx: ExtensionContext,
+  workDir: string,
+  experimentId: string | null = null,
+): boolean | null {
   const canonicalWorkDir = canonicalPath(workDir);
   let decision: boolean | null = null;
 
@@ -550,7 +633,9 @@ function recordedActivationDecision(ctx: ExtensionContext, workDir: string): boo
     if (entry.type !== "custom") continue;
 
     const data = autoresearchActivationData(entry);
-    if (!data || canonicalPath(data.workDir) !== canonicalWorkDir) continue;
+    if (!data || typeof data.workDir !== "string") continue;
+    if (canonicalPath(data.workDir) !== canonicalWorkDir) continue;
+    if ((data.experimentId ?? null) !== experimentId) continue;
 
     decision = data.active === true;
   }
@@ -597,14 +682,18 @@ function findBestMetric(
 
 // -----------------------------------------------------------------------
 // Session file paths (single source of truth for autoresearch.* filenames)
+//
+// `dir` is always the state root — the main worktree holding `.auto/` — which
+// is the session cwd in shared mode and the main checkout in worktree mode.
+// The optional experiment id selects that experiment's private state folder.
 // -----------------------------------------------------------------------
 
-const autoresearchJsonlPath  = (dir: string) => sessionFilePath(dir, "log");
-const autoresearchMdPath     = (dir: string) => sessionFilePath(dir, "prompt");
-const autoresearchIdeasPath  = (dir: string) => sessionFilePath(dir, "ideas");
-const autoresearchChecksPath = (dir: string) => sessionFilePath(dir, "checks");
-const autoresearchScriptPath = (dir: string) => sessionFilePath(dir, "measure");
-const autoresearchConfigPath = (dir: string) => sessionFilePath(dir, "config");
+const autoresearchJsonlPath  = (dir: string, id?: string | null) => sessionFilePath(dir, "log", id);
+const autoresearchMdPath     = (dir: string, id?: string | null) => sessionFilePath(dir, "prompt", id);
+const autoresearchIdeasPath  = (dir: string, id?: string | null) => sessionFilePath(dir, "ideas", id);
+const autoresearchChecksPath = (dir: string, id?: string | null) => sessionFilePath(dir, "checks", id);
+const autoresearchScriptPath = (dir: string, id?: string | null) => sessionFilePath(dir, "measure", id);
+const autoresearchConfigPath = (dir: string, id?: string | null) => sessionFilePath(dir, "config", id);
 
 function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
   const index = results.findIndex((result) => result.segment === segment);
@@ -734,6 +823,8 @@ function createSessionRuntime(): AutoresearchRuntime {
     state: createExperimentState(),
     pendingResumeTimer: null,
     pendingResumeMessage: null,
+    experimentId: null,
+    stateRoot: null,
   };
 }
 
@@ -1089,8 +1180,357 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
 
+  const gitRunner: GitRunner = async (args, cwd, timeoutMs = 10_000) => {
+    const result = await pi.exec("git", args, { cwd, timeout: timeoutMs });
+    return { code: result.code, stdout: result.stdout, stderr: result.stderr };
+  };
+
+  /** Main worktree holding the registry and every `.auto/` state file. */
+  const stateRoot = (ctx: ExtensionContext): string => getRuntime(ctx).stateRoot ?? ctx.cwd;
+
+  /** Experiment this session is bound to, or null before its first use. */
+  const experimentId = (ctx: ExtensionContext): string | null => getRuntime(ctx).experimentId;
+
+  const experimentRecord = (ctx: ExtensionContext): ExperimentRecord | null => {
+    const id = experimentId(ctx);
+    if (!id) return null;
+    return getExperiment(stateRoot(ctx), id);
+  };
+
+  /**
+   * Where this experiment's code and git operations live. A worktree
+   * experiment owns its directory outright; a shared experiment works in the
+   * checkout the session was started in.
+   */
+  const codeDir = (ctx: ExtensionContext): string => {
+    const record = experimentRecord(ctx);
+    if (record?.mode === "worktree") return record.workDir;
+    return resolveWorkDir(ctx.cwd);
+  };
+
+  const bindExperiment = (ctx: ExtensionContext, root: string, id: string): void => {
+    const runtime = getRuntime(ctx);
+    runtime.stateRoot = root;
+    runtime.experimentId = id;
+    pi.appendEntry(AUTORESEARCH_BINDING_ENTRY, {
+      version: 2,
+      root: canonicalPath(root),
+      experimentId: id,
+    });
+  };
+
+  /**
+   * Resolve the experiment this session belongs to.
+   *
+   * A recorded binding wins; otherwise a session physically sitting inside a
+   * registered worktree adopts that experiment, which is what makes relaunching
+   * pi inside a worktree pick the experiment back up with no extra command.
+   */
+  const resolveExperiment = async (
+    ctx: ExtensionContext,
+  ): Promise<{ root: string; record: ExperimentRecord | null }> => {
+    // Without a git repository there is no registry, so keep the pre-experiment
+    // layout — which honours a `workingDir` redirect in config.json.
+    const root = await resolveRegistryRoot(gitRunner, ctx.cwd) ?? resolveWorkDir(ctx.cwd);
+    if (!root) return { root: ctx.cwd, record: null };
+
+    const runtime = getRuntime(ctx);
+    runtime.stateRoot = root;
+
+    const bound = recordedBinding(ctx, root);
+    if (bound) {
+      const record = getExperiment(root, bound);
+      if (record) {
+        runtime.experimentId = record.id;
+        return { root, record };
+      }
+    }
+
+    // Only a worktree makes "I am sitting in this directory" a reliable signal.
+    // A shared experiment shares its directory with every other shared
+    // experiment by definition, so adopting one there would hand this session
+    // somebody else's history.
+    const byWorkDir = findExperimentByWorkDir(root, ctx.cwd);
+    if (byWorkDir && byWorkDir.mode === "worktree") {
+      runtime.experimentId = byWorkDir.id;
+      return { root, record: byWorkDir };
+    }
+
+    return { root, record: null };
+  };
+
+  /**
+   * Bind the session to an experiment, creating one on first use.
+   *
+   * An implicitly created experiment is always `shared`: the session is already
+   * sitting in this checkout, and silently redirecting its edits into a
+   * worktree it was never launched in would split code from measurement. Worktree
+   * isolation is opt-in through `/autoresearch new <name>`, which scaffolds the
+   * worktree and tells you to relaunch pi inside it.
+   */
+  const ensureExperiment = async (
+    ctx: ExtensionContext,
+    suggestedName?: string,
+  ): Promise<{ root: string; record: ExperimentRecord }> => {
+    const resolved = await resolveExperiment(ctx);
+    if (resolved.record) {
+      bindExperiment(ctx, resolved.root, resolved.record.id);
+      return { root: resolved.root, record: resolved.record };
+    }
+
+    const root = resolved.root;
+    const cwd = resolveWorkDir(ctx.cwd);
+
+    // Under the lock so two sessions claiming an experiment for the first time
+    // cannot both read the same registry and race each other's write.
+    const record = await withGitLock(gitLockPath(root), async () => {
+      const [head, dirty] = await Promise.all([headSha(gitRunner, cwd), dirtyEntries(gitRunner, cwd)]);
+      return createExperiment(root, {
+        name: suggestedName ?? null,
+        mode: "shared",
+        workDir: cwd,
+        branch: null,
+        baselineHead: head,
+        baselineDirty: dirtyPaths(dirty),
+      });
+    });
+    bindExperiment(ctx, root, record.id);
+    return { root, record };
+  };
+
   // Registering through this gates the tool, so a new one can't slip in ungated.
   const gatedToolNames = new Set<string>();
+
+  /**
+   * Decide whether the git layer may act on this working tree, and explain
+   * itself when it may not.
+   *
+   * With no other experiment around, a shared tree behaves exactly as it always
+   * has — one experiment, full repository operations, nothing to protect.
+   *
+   * Once a sibling is live, the tree is genuinely shared and change attribution
+   * becomes guesswork: nothing distinguishes this agent's edit to a file from a
+   * sibling's edit to the same file. So the rules tighten. The first result is
+   * refused outright, because there is no prior claim to diff against. After
+   * that, paths already claimed by a sibling are off limits and a discard is
+   * refused if HEAD moved.
+   */
+  /**
+   * Record that a result was observed. Must be called while holding the git
+   * lock, so a concurrent write cannot discard this.
+   *
+   * A refused result still counts: the experiment has now been measured, which
+   * is exactly what the first-result gate compares against. Without this the
+   * gate would re-fire forever and the experiment could never commit or discard
+   * anything, however many results it logged.
+   */
+  const countResult = (root: string, record: ExperimentRecord): void => {
+    updateExperiment(root, record.id, { resultCount: record.resultCount + 1 });
+  };
+
+  const sharedTreeVerdict = (
+    root: string,
+    record: ExperimentRecord,
+  ): { allowed: true } | { allowed: false; message: string } => {
+    const siblings = concurrentExperiments(root, record.id);
+    if (siblings.length === 0) return { allowed: true };
+
+    const names = siblings.map((s) => s.id).join(", ");
+    if (record.resultCount === 0) {
+      return {
+        allowed: false,
+        message:
+          `\n⚠️ Git: not touching git. Experiment "${record.id}" shares this working tree with ` +
+          `${names}, and its first result cannot be told apart from their uncommitted work.\n` +
+          "   The measurement is logged; the keep or discard is left to you. Revert or stage it by hand,\n" +
+          "   or give this experiment its own worktree: /autoresearch new <name>",
+      };
+    }
+    return { allowed: true };
+  };
+
+  /** Paths a sibling has already claimed; never ours to stage or revert. */
+  const pathsOwnedBySiblings = (root: string, id: string): Set<string> => {
+    const owned = new Set<string>();
+    for (const other of listExperiments(root)) {
+      if (other.id === id) continue;
+      for (const p of other.claimedPaths) owned.add(p);
+    }
+    return owned;
+  };
+
+  /**
+   * The original repository-wide commit, used whenever nothing else shares this
+   * working tree. Kept as it was so a solo run behaves exactly as it did before
+   * experiments existed.
+   */
+  const repoWideKeepCommit = async (
+    workDir: string,
+    commitMsg: string,
+    experiment: ExperimentResult,
+  ): Promise<string> => {
+    try {
+      const execOpts = { cwd: workDir, timeout: 10000 };
+      const addResult = await pi.exec("git", ["add", "-A"], execOpts);
+      if (addResult.code !== 0) {
+        const addErr = (addResult.stdout + addResult.stderr).trim();
+        throw new Error(`git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`);
+      }
+
+      const diffResult = await pi.exec("git", ["diff", "--cached", "--quiet"], execOpts);
+      if (diffResult.code === 0) {
+        return `\n📝 Git: nothing to commit (working tree clean)`;
+      }
+
+      const gitResult = await pi.exec("git", ["commit", "-m", commitMsg], execOpts);
+      const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
+      if (gitResult.code !== 0) {
+        return `\n⚠️ Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
+      }
+
+      const newSha = await headSha(gitRunner, workDir);
+      if (newSha && newSha.length >= 7) {
+        experiment.commit = newSha;
+      }
+      return `\n📝 Git: committed — ${gitOutput.split("\n")[0] || ""}`;
+    } catch (e) {
+      return `\n⚠️ Git commit error: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  };
+
+  /** The original repository-wide revert, used whenever nothing else shares this tree. */
+  const repoWideRevert = async (workDir: string): Promise<string> => {
+    try {
+      const revertScript = `
+        git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+        git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
+      `;
+      await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
+      return `\n📝 Git: reverted changes — autoresearch files preserved`;
+    } catch (e) {
+      return `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  };
+
+  /**
+   * Commit inside a shared working tree: stage only what this experiment
+   * changed, and never `git add -A` — that would sweep a sibling's in-flight
+   * work into this experiment's commit.
+   */
+  const scopedKeepCommit = async (
+    ctx: ExtensionContext,
+    record: ExperimentRecord | null,
+    workDir: string,
+    commitMsg: string,
+    experiment: ExperimentResult,
+  ): Promise<string> => {
+    if (!record) return "\n⚠️ No experiment record — skipping git commit.";
+    const root = stateRoot(ctx);
+
+    try {
+      return await withGitLock(gitLockPath(root), async () => {
+        // Re-read under the lock: a sibling may have committed since the caller
+        // built this record, and the verdict depends on live registry state.
+        const fresh = getExperiment(root, record.id) ?? record;
+        const verdict = sharedTreeVerdict(root, fresh);
+        if (!verdict.allowed) {
+          countResult(root, fresh);
+          return verdict.message;
+        }
+
+        const current = await dirtyEntries(gitRunner, workDir);
+        const siblingOwned = pathsOwnedBySiblings(root, fresh.id);
+        const claimed = dirtyPaths(claimedBy(current, fresh.baselineDirty));
+        const paths = claimed.filter((p) => !siblingOwned.has(p));
+        const skipped = claimed.filter((p) => siblingOwned.has(p));
+
+        const result = await scopedCommit(gitRunner, { cwd: workDir, paths, message: commitMsg });
+        if (result.committed && result.sha) {
+          experiment.commit = result.sha;
+          // A clean commit is a clean slate for the next run's attribution.
+          updateExperiment(root, fresh.id, {
+            baselineHead: result.sha,
+            baselineDirty: [],
+            claimedPaths: [],
+            resultCount: fresh.resultCount + 1,
+          });
+          return `\n📝 Git: committed ${result.staged.length} file(s) — ${result.message}`;
+        }
+        updateExperiment(root, fresh.id, {
+          claimedPaths: paths,
+          resultCount: fresh.resultCount + 1,
+        });
+        const skipNote = skipped.length > 0
+          ? `\n   Left alone (claimed by another experiment): ${skipped.join(", ")}`
+          : "";
+        return `\n📝 Git: ${result.message}${skipNote}`;
+      });
+    } catch (e) {
+      return `\n⚠️ Git commit error: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  };
+
+  /**
+   * Discard inside a shared working tree: undo only this experiment's files,
+   * and refuse outright when HEAD moved under us.
+   */
+  const scopedDiscard = async (
+    ctx: ExtensionContext,
+    record: ExperimentRecord | null,
+    workDir: string,
+  ): Promise<string> => {
+    if (!record) {
+      return "\n⚠️ No experiment record — refusing to discard in a shared working tree.";
+    }
+    const root = stateRoot(ctx);
+
+    try {
+      return await withGitLock(gitLockPath(root), async () => {
+        const fresh = getExperiment(root, record.id) ?? record;
+        const verdict = sharedTreeVerdict(root, fresh);
+        if (!verdict.allowed) {
+          countResult(root, fresh);
+          return verdict.message;
+        }
+
+        const [current, headNow] = await Promise.all([
+          dirtyEntries(gitRunner, workDir),
+          headSha(gitRunner, workDir),
+        ]);
+        const siblingOwned = pathsOwnedBySiblings(root, fresh.id);
+        const all = dirtyPaths(claimedBy(current, fresh.baselineDirty));
+        const paths = all.filter((p) => !siblingOwned.has(p));
+
+        const result = await scopedRevert(gitRunner, {
+          cwd: workDir,
+          paths,
+          headBefore: fresh.baselineHead,
+          headNow,
+        });
+
+        if (!result.reverted) {
+          const keepNote = all.length > paths.length
+            ? `\n   Left alone (claimed by another experiment): ${all.filter((p) => siblingOwned.has(p)).join(", ")}`
+            : "";
+          return result.reason
+            ? `\n⚠️ Git: ${result.reason}${keepNote}`
+            : `\n📝 Git: nothing to revert${keepNote}`;
+        }
+        if (result.failed.length > 0) {
+          return `\n⚠️ Git: reverted ${result.restored.length + result.removed.length} file(s), ` +
+            `but could not revert: ${result.failed.join(", ")}`;
+        }
+        updateExperiment(root, fresh.id, { claimedPaths: [], resultCount: fresh.resultCount + 1 });
+        return (
+          `\n📝 Git: reverted ${result.restored.length} changed and ${result.removed.length} new file(s)` +
+          " — autoresearch files preserved"
+        );
+      });
+    } catch (e) {
+      return `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  };
+
   const registerGatedTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
     gatedToolNames.add(tool.name);
     pi.registerTool(tool);
@@ -1106,10 +1546,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     pi.setActiveTools([...activeTools]);
   };
 
-  const recordAutoresearchActivation = (workDir: string, active: boolean): void => {
+  const recordAutoresearchActivation = (
+    ctx: ExtensionContext,
+    workDir: string,
+    active: boolean,
+  ): void => {
     pi.appendEntry(AUTORESEARCH_ACTIVATION_ENTRY, {
-      version: 1,
+      version: 2,
       workDir: canonicalPath(workDir),
+      experimentId: experimentId(ctx),
       active,
     });
   };
@@ -1212,7 +1657,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return {
       compaction: {
         summary: buildAutoresearchCompactionSummary(
-          autoresearchSummaryPathsFor(resolveWorkDir(ctx.cwd)),
+          autoresearchSummaryPathsFor(stateRoot(ctx), experimentId(ctx)),
         ),
         firstKeptEntryId: event.preparation.firstKeptEntryId,
         tokensBefore: event.preparation.tokensBefore,
@@ -1230,24 +1675,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const hasAutoresearchRules = (ctx: ExtensionContext): boolean =>
-    fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)));
+    fs.existsSync(autoresearchMdPath(stateRoot(ctx), experimentId(ctx)));
 
-  const readJsonlLines = (workDir: string): string[] => {
-    const jsonlPath = autoresearchJsonlPath(workDir);
+  const readJsonlLines = (ctx: ExtensionContext): string[] => {
+    const jsonlPath = autoresearchJsonlPath(stateRoot(ctx), experimentId(ctx));
     if (!fs.existsSync(jsonlPath)) return [];
     return fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
   };
 
-  const readLastRun = (workDir: string): Record<string, unknown> | null => {
-    const lines = readJsonlLines(workDir);
+  const readLastRun = (ctx: ExtensionContext): Record<string, unknown> | null => {
+    const id = experimentId(ctx);
+    const lines = readJsonlLines(ctx);
     for (let i = lines.length - 1; i >= 0; i--) {
       const entry = parseJsonlEntry(lines[i]);
-      if (isAutoresearchRunEntry(entry)) return entry;
+      if (isAutoresearchRunEntry(entry) && entryBelongsToExperiment(entry, id)) return entry;
     }
     return null;
   };
 
-  const buildSessionSnapshot = (state: ExperimentState): SessionSnapshot => ({
+  const buildSessionSnapshot = (ctx: ExtensionContext, state: ExperimentState): SessionSnapshot => ({
+    experiment: experimentId(ctx),
     metric_name: state.metricName,
     metric_unit: state.metricUnit,
     direction: state.bestDirection,
@@ -1257,20 +1704,43 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     goal: state.name ?? "",
   });
 
-  const fireHook = async (payload: HookPayload): Promise<string | null> => {
+  const fireHook = async (ctx: ExtensionContext, payload: HookPayload): Promise<string | null> => {
     const result = await runHook(payload);
-    appendHookLogEntryIfConfigured(autoresearchJsonlPath(payload.cwd), payload.event, result);
+    appendHookLogEntryIfConfigured(
+      autoresearchJsonlPath(stateRoot(ctx), payload.experiment),
+      payload.event,
+      result,
+      payload.experiment,
+    );
     return steerMessageFor(payload.event, result);
   };
 
-  // Running experiment state (for spinner in fullscreen overlay)
+  // Running experiment state (for spinner in fullscreen overlay).
+  // Tagged with the owning session so one session's shutdown cannot tear down
+  // an overlay another session in this process is still driving.
   let overlayTui: { requestRender: () => void } | null = null;
+  let overlaySessionKey: string | null = null;
   let spinnerInterval: ReturnType<typeof setInterval> | null = null;
   let spinnerFrame = 0;
   const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-  const clearOverlay = () => {
+  const ownsOverlay = (ctx?: ExtensionContext): boolean =>
+    ctx === undefined || overlaySessionKey === null || overlaySessionKey === getSessionKey(ctx);
+
+  const claimOverlay = (ctx: ExtensionContext, tui: { requestRender: () => void }): void => {
+    if (!ownsOverlay(ctx)) return;
+    overlayTui = tui;
+    overlaySessionKey = getSessionKey(ctx);
+  };
+
+  const requestOverlayRender = (ctx: ExtensionContext): void => {
+    if (ownsOverlay(ctx)) overlayTui?.requestRender();
+  };
+
+  const clearOverlay = (ctx?: ExtensionContext) => {
+    if (!ownsOverlay(ctx)) return;
     overlayTui = null;
+    overlaySessionKey = null;
     if (spinnerInterval) {
       clearInterval(spinnerInterval);
       spinnerInterval = null;
@@ -1278,7 +1748,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const clearSessionUi = (ctx: ExtensionContext) => {
-    clearOverlay();
+    clearOverlay(ctx);
     if (ctx.hasUI) {
       ctx.ui.setWidget("autoresearch", undefined);
     }
@@ -1286,18 +1756,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|export|dashboard|<text>]",
+      "Usage: /autoresearch [off|clear|export|dashboard|list|new|join|drop|<text>]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
+      "  A session that has not claimed an experiment gets its own on first use.",
       "off leaves autoresearch mode.",
-      "clear deletes the session log (.auto/log.jsonl) and turns autoresearch mode off.",
-      "export opens a local live dashboard for the session log in your browser.",
+      "clear deletes this experiment's log and turns autoresearch mode off.",
+      "export opens a local live dashboard for this experiment in your browser.",
       "dashboard opens the fullscreen dashboard overlay in the terminal.",
+      "",
+      "list shows every experiment in this repository (* marks this session).",
+      "new <name> creates an experiment in its own git worktree — full isolation.",
+      "new <name> --shared creates one in this checkout, with scoped git operations.",
+      "join <id> binds this session to an existing experiment.",
+      "drop <id> removes an experiment, its state, and its worktree.",
 
+      "",
+      "Running two experiments at once? Give each its own worktree:",
+      "  /autoresearch new parser-speed          # then: cd .auto/worktrees/parser-speed && pi",
+      "  /autoresearch new render-cache --shared  # if a second checkout is not possible",
       "",
       "Examples:",
       "  /autoresearch optimize unit test runtime, monitor correctness",
       "  /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target",
+      "  /autoresearch list",
       "  /autoresearch export",
       "  /autoresearch dashboard",
     ].join("\n");
@@ -1306,9 +1788,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // State reconstruction
   // -----------------------------------------------------------------------
 
-  const reconstructState = (ctx: ExtensionContext) => {
+  const reconstructState = async (ctx: ExtensionContext) => {
     const runtime = getRuntime(ctx);
     cancelPendingResume(runtime);
+
+    // Work out which experiment this session is before touching any state, so
+    // a session never reconstructs from a sibling's log.
+    await resolveExperiment(ctx);
     runtime.lastRunChecks = null;
     runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
@@ -1318,16 +1804,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     let state = runtime.state;
 
-    // Resolve effective working directory (config stays in ctx.cwd, files in workDir)
-    const workDir = resolveWorkDir(ctx.cwd);
+    // State lives in the main worktree; the experiment id selects this
+    // session's private folder inside it.
+    const root = stateRoot(ctx);
+    const id = experimentId(ctx);
+    const workDir = codeDir(ctx);
 
     // Primary: read from .auto/log.jsonl (alongside .auto/prompt.md and .auto/measure.sh)
-    const jsonlPath = autoresearchJsonlPath(workDir);
+    const jsonlPath = autoresearchJsonlPath(root, id);
     const hasPersistedLog = fs.existsSync(jsonlPath);
     let loadedFromJsonl = false;
     try {
       if (hasPersistedLog) {
-        const reconstructed = reconstructJsonlState(fs.readFileSync(jsonlPath, "utf-8"));
+        const reconstructed = reconstructJsonlState(fs.readFileSync(jsonlPath, "utf-8"), id);
         state.name = reconstructed.name;
         state.metricName = reconstructed.metricName;
         state.metricUnit = reconstructed.metricUnit;
@@ -1357,7 +1846,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (msg.role !== "toolResult" || msg.toolName !== "log_experiment")
           continue;
         const details = msg.details as LogDetails | undefined;
-        if (details?.state) {
+        if (details?.state && (details.experimentId === undefined || details.experimentId === id)) {
           runtime.state = cloneExperimentState(details.state);
           state = runtime.state;
           if (!state.secondaryMetrics) state.secondaryMetrics = [];
@@ -1377,19 +1866,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
 
     // Read max experiments from config file
-    state.maxExperiments = readMaxExperiments(ctx.cwd);
+    state.maxExperiments = readMaxExperiments(ctx.cwd, id);
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists.
-    // A recorded `/autoresearch on|off` in this session wins; otherwise same-cwd
-    // sessions default on and redirected workingDir sessions default off, so
-    // unrelated chats launched from a shared cwd never activate it.
+    // A recorded `/autoresearch on|off` in this session wins; otherwise a session
+    // sitting in its own worktree defaults on, and a shared-directory session
+    // defaults on too — but only for the experiment it is actually bound to, so
+    // an unrelated chat in the same checkout never adopts someone else's run.
     setAutoresearchMode(
       ctx,
       shouldAutoActivateAutoresearch(
         ctx.cwd,
         workDir,
         hasPersistedLog,
-        recordedActivationDecision(ctx, workDir),
+        recordedActivationDecision(ctx, workDir, id),
       ),
     );
 
@@ -1401,6 +1891,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     const runtime = getRuntime(ctx);
     const state = runtime.state;
+    const id = experimentId(ctx);
 
     if (!runtime.autoresearchMode) {
       ctx.ui.setWidget("autoresearch", undefined);
@@ -1438,7 +1929,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         render(width: number): string[] {
           const safeWidth = Math.max(1, width || getTuiSize(tui).width);
           const title = truncateDisplayText(
-            `🔬 autoresearch${state.name ? `: ${state.name}` : ""}`,
+            `🔬 autoresearch${id ? ` [${id}]` : ""}${state.name ? `: ${state.name}` : ""}`,
             Math.max(0, safeWidth - 5)
           );
           const fillLen = Math.max(0, safeWidth - 3 - 1 - visibleWidth(title) - 1);
@@ -1468,14 +1959,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_tree", async (_e, ctx) => reconstructState(ctx));
-  pi.on("session_before_switch", async () => {
-    clearOverlay();
+  pi.on("session_before_switch", async (_e, ctx) => {
+    clearOverlay(ctx);
   });
   pi.on("session_shutdown", async (_e, ctx) => {
     clearSessionUi(ctx);
     cancelPendingResume(getRuntime(ctx));
+    const ownedTheServer = dashboardServerSessionKey === getSessionKey(ctx);
     runtimeStore.clear(getSessionKey(ctx));
-    stopDashboardServer();
+    // Only tear down the export server this session started; another session
+    // sharing this process may still be streaming from it.
+    if (ownedTheServer) stopDashboardServer();
   });
 
   pi.on("agent_start", async (_event, ctx) => {
@@ -1525,20 +2019,35 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     if (!runtime.autoresearchMode) return;
 
-    const workDir = resolveWorkDir(ctx.cwd);
-    const mdPath = autoresearchMdPath(workDir);
-    const ideasPath = autoresearchIdeasPath(workDir);
+    const mdPath = autoresearchMdPath(stateRoot(ctx), experimentId(ctx));
+    const ideasPath = autoresearchIdeasPath(stateRoot(ctx), experimentId(ctx));
     const hasIdeas = fs.existsSync(ideasPath);
 
-    const checksPath = autoresearchChecksPath(workDir);
+    const checksPath = autoresearchChecksPath(stateRoot(ctx), experimentId(ctx));
     const hasChecks = fs.existsSync(checksPath);
+
+    const measurePath = autoresearchScriptPath(stateRoot(ctx), experimentId(ctx));
+    const hasMeasure = fs.existsSync(measurePath);
+
+    const id = experimentId(ctx);
+    const modeNote = experimentRecord(ctx)?.mode === "worktree"
+      ? "\nThis experiment owns a dedicated git worktree; its commits and discards cannot affect other experiments."
+      : "\nThis experiment shares a working tree with any others in this repo. Only edit files this experiment owns — a commit that touches another experiment's files is refused, and a discard is refused if another experiment moved HEAD.";
 
     let extra =
       "\n\n## Autoresearch Mode (ACTIVE)" +
       "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
       "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
+      (id ? `\nExperiment id: ${id}.` : "") +
+      modeNote +
+      // The benchmark lives with the state in the main worktree, while commands
+      // run in the experiment's code directory — so a relative path to it does
+      // not resolve in worktree mode. Hand over the absolute path.
+      (hasMeasure
+        ? `\nBenchmark: run it as \`${measurePath}\`. Use this absolute path, not a relative one.`
+        : "") +
       `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
-      "\nWrite promising but deferred optimizations as bullet points to .auto/ideas.md — don't let good ideas get lost." +
+      `\nWrite promising but deferred optimizations as bullet points to ${ideasPath} — don't let good ideas get lost.` +
       `\n${BENCHMARK_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
 
@@ -1594,6 +2103,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const isReinit = state.results.length > 0;
 
+      // First tool call in a session claims an experiment; every later write
+      // is stamped so a sibling session can never read or clobber it.
+      const { root, record } = await ensureExperiment(ctx, params.name);
+      const id = record.id;
+      const workDir = codeDir(ctx);
+      const jsonlPath = autoresearchJsonlPath(root, id);
+      if (record.name === null) updateExperiment(root, id, { name: params.name });
+
       state.name = params.name;
       state.metricName = params.metric_name;
       state.metricUnit = params.metric_unit ?? "";
@@ -1610,15 +2127,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.confidence = null;
 
       // Read max experiments from config file (config always in ctx.cwd)
-      state.maxExperiments = readMaxExperiments(ctx.cwd);
+      state.maxExperiments = readMaxExperiments(ctx.cwd, id);
 
       // Write config header to jsonl (append for re-init, create for first)
-      const workDir = resolveWorkDir(ctx.cwd);
       try {
-        const jsonlPath = autoresearchJsonlPath(workDir);
         ensureParentDir(jsonlPath);
         const config = JSON.stringify({
           type: "config",
+          experiment: id,
           name: state.name,
           metricName: state.metricName,
           metricUnit: state.metricUnit,
@@ -1629,7 +2145,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else {
           fs.writeFileSync(jsonlPath, config + "\n");
         }
-        broadcastDashboardUpdate(workDir);
+        broadcastDashboardUpdate(jsonlPath);
       } catch (e) {
         return {
           content: [{
@@ -1641,17 +2157,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const wasInactive = !runtime.autoresearchMode;
-      recordAutoresearchActivation(workDir, true);
+      recordAutoresearchActivation(ctx, workDir, true);
       setAutoresearchMode(ctx, true);
       updateWidget(ctx);
 
       if (wasInactive) {
-        const steer = await fireHook({
+        const steer = await fireHook(ctx, {
           event: "before",
           cwd: workDir,
+          state_root: root,
+          experiment: id,
           next_run: state.results.length + 1,
-          last_run: readLastRun(workDir),
-          session: buildSessionSnapshot(state),
+          last_run: readLastRun(ctx),
+          session: buildSessionSnapshot(ctx, state),
         });
         if (steer) pi.sendUserMessage(steer, { deliverAs: "steer" });
       }
@@ -1659,12 +2177,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from .auto/config.json)` : "";
       const workDirNote = workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
+      const isolationNote = record.mode === "worktree"
+        ? ""
+        : "\n⚠️ Shared working tree: commits and discards are scoped to the files this experiment changed, and a discard is refused if another experiment moved HEAD. Use '/autoresearch new <name>' for full worktree isolation.";
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to .auto/log.jsonl. Now run the baseline with run_experiment.`,
+          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nExperiment id: ${id}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to .auto/experiments/${id}/log.jsonl. Now run the baseline with run_experiment.${isolationNote}`,
         }],
-        details: { state: cloneExperimentState(state) },
+        details: { experimentId: id, state: cloneExperimentState(state) },
       };
     },
 
@@ -1711,7 +2232,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           details: {},
         };
       }
-      const workDir = resolveWorkDir(ctx.cwd);
+      // Runs happen in the experiment's own code directory: a worktree
+      // experiment measures its worktree, a shared one measures this checkout.
+      const root = stateRoot(ctx);
+      const id = experimentId(ctx);
+      const workDir = codeDir(ctx);
 
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
@@ -1727,13 +2252,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
       // Guard: if the benchmark script exists, only allow running it
-      const autoresearchShPath = autoresearchScriptPath(workDir);
+      const autoresearchShPath = autoresearchScriptPath(root, id);
       const benchmarkScriptRel = path.relative(workDir, autoresearchShPath) || path.basename(autoresearchShPath);
       if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
         return {
           content: [{
             type: "text",
-            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash ${benchmarkScriptRel}" }) or run_experiment({ command: "./${benchmarkScriptRel}" })`,
+            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse the absolute path: run_experiment({ command: "bash ${autoresearchShPath}" })\nA relative path will not resolve — the benchmark lives with the session state, which is not inside this experiment's code directory.`,
           }],
           details: {
             command: params.command,
@@ -1754,7 +2279,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
-      if (overlayTui) overlayTui.requestRender();
+      requestOverlayRender(ctx);
 
       const t0 = Date.now();
 
@@ -1919,7 +2444,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }).finally(() => {
         runtime.runningExperiment = null;
         updateWidget(ctx);
-        if (overlayTui) overlayTui.requestRender();
+        requestOverlayRender(ctx);
       });
 
       const durationSeconds = (Date.now() - t0) / 1000;
@@ -1932,7 +2457,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let checksOutput = "";
       let checksDuration = 0;
 
-      const checksPath = autoresearchChecksPath(workDir);
+      const checksPath = autoresearchChecksPath(root, id);
       if (benchmarkPassed && fs.existsSync(checksPath)) {
         const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
@@ -2009,6 +2534,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s\n`;
       } else if (!benchmarkPassed) {
         text += `💥 FAILED (exit code ${exitCode}) in ${durationSeconds.toFixed(1)}s\n`;
+        // A worktree experiment's benchmark lives with the state in the main
+        // worktree, so a relative path to it cannot resolve from the code
+        // directory. Say so instead of leaving a bare "No such file".
+        if (isAutoresearchShCommand(params.command)) {
+          text +=
+            `The benchmark exists at ${autoresearchShPath} but this command could not run it.\n` +
+            `Use its absolute path: run_experiment({ command: "bash ${autoresearchShPath}" })\n`;
+        }
       } else if (checksTimedOut) {
         text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
         text += `⏰ CHECKS TIMEOUT (.auto/checks.sh) after ${checksDuration.toFixed(1)}s\n`;
@@ -2230,7 +2763,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           details: {},
         };
       }
-      const workDir = resolveWorkDir(ctx.cwd);
+      const root = stateRoot(ctx);
+      const id = experimentId(ctx);
+      const workDir = codeDir(ctx);
+      const record = experimentRecord(ctx);
       const secondaryMetrics = params.metrics ?? {};
 
       // Gate: prevent "keep" when last run's checks failed
@@ -2378,86 +2914,65 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       text += `)`;
 
-      // Auto-commit only on keep — discards/crashes get reverted anyway
+      // Git strategy is decided once, from the shape of the working tree.
+      //
+      // A worktree experiment owns its tree outright, and a shared experiment
+      // with no live sibling has nothing to protect — both keep the original
+      // repository-wide behaviour. Only a shared experiment sharing its checkout
+      // with a live sibling needs the scoped, locked path, because repository-wide
+      // operations there would reach into somebody else's experiment.
+      const siblings = record ? concurrentExperiments(root, record.id) : [];
+      const repoWideGit = record === null || record.mode === "worktree" || siblings.length === 0;
+
       if (params.status === "keep") {
-        try {
-          const resultData: Record<string, unknown> = {
-            status: params.status,
-            [state.metricName || "metric"]: params.metric,
-            ...secondaryMetrics,
-          };
-          const trailerJson = JSON.stringify(resultData);
-          const commitMsg = `${params.description}\n\nResult: ${trailerJson}`;
+        const resultData: Record<string, unknown> = {
+          status: params.status,
+          [state.metricName || "metric"]: params.metric,
+          ...secondaryMetrics,
+        };
+        const commitMsg = `${params.description}\n\nResult: ${JSON.stringify(resultData)}`;
 
-          const execOpts = { cwd: workDir, timeout: 10000 };
-          const addResult = await pi.exec("git", ["add", "-A"], execOpts);
-          if (addResult.code !== 0) {
-            const addErr = (addResult.stdout + addResult.stderr).trim();
-            throw new Error(`git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`);
-          }
-
-          const diffResult = await pi.exec("git", ["diff", "--cached", "--quiet"], execOpts);
-          if (diffResult.code === 0) {
-            text += `\n📝 Git: nothing to commit (working tree clean)`;
-          } else {
-            const gitResult = await pi.exec("git", ["commit", "-m", commitMsg], execOpts);
-            const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
-            if (gitResult.code === 0) {
-              const firstLine = gitOutput.split("\n")[0] || "";
-              text += `\n📝 Git: committed — ${firstLine}`;
-
-              try {
-                const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
-                const newSha = (shaResult.stdout || "").trim();
-                if (newSha && newSha.length >= 7) {
-                  experiment.commit = newSha;
-                }
-              } catch {
-                // Keep the original commit hash if rev-parse fails
-              }
-            } else {
-              text += `\n⚠️ Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
-            }
-          }
-        } catch (e) {
-          text += `\n⚠️ Git commit error: ${e instanceof Error ? e.message : String(e)}`;
+        if (repoWideGit) {
+          text += await repoWideKeepCommit(workDir, commitMsg, experiment);
+          if (record) updateExperiment(root, record.id, { resultCount: record.resultCount + 1 });
+        } else {
+          text += await scopedKeepCommit(ctx, record, workDir, commitMsg, experiment);
         }
       }
 
       const jsonlEntry: Record<string, unknown> = {
         run: state.results.length,
+        ...(id ? { experiment: id } : {}),
         ...experiment,
       };
       if (!mergedASI) delete jsonlEntry.asi;
       const jsonlLine = JSON.stringify(jsonlEntry);
 
       try {
-        const jsonlPath = autoresearchJsonlPath(workDir);
+        const jsonlPath = autoresearchJsonlPath(root, id);
         ensureParentDir(jsonlPath);
         fs.appendFileSync(jsonlPath, jsonlLine + "\n");
-        broadcastDashboardUpdate(workDir);
+        broadcastDashboardUpdate(jsonlPath);
       } catch (e) {
         text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
       if (params.status !== "keep") {
-        try {
-          const revertScript = `
-            git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
-            git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
-          `;
-          await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
-          text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
-        } catch (e) {
-          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+        if (repoWideGit) {
+          text += await repoWideRevert(workDir);
+          if (record) updateExperiment(root, record.id, { resultCount: record.resultCount + 1 });
+        } else {
+          text += await scopedDiscard(ctx, record, workDir);
         }
       }
 
-      const afterSteer = await fireHook({
+      const afterSteer = await fireHook(ctx, {
         event: "after",
         cwd: workDir,
+        state_root: root,
+        experiment: id,
         run_entry: jsonlEntry,
-        session: buildSessionSnapshot(state),
+        session: buildSessionSnapshot(ctx, state),
       });
       if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
 
@@ -2469,17 +2984,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
-        recordAutoresearchActivation(workDir, false);
+        recordAutoresearchActivation(ctx, workDir, false);
         setAutoresearchMode(ctx, false);
         ctx.abort();
       } else if (runtime.autoresearchMode) {
         text += "\n\nBefore choosing the next experiment, consider whether this result or discovery invalidates a previous discard's rollback reason. If so, name what changed and weigh a targeted retry against other candidates. Otherwise, move on. Don't revive a discarded idea without a changed assumption. Verification reruns to resolve measurement noise are separate.";
-        const beforeSteer = await fireHook({
+        const beforeSteer = await fireHook(ctx, {
           event: "before",
           cwd: workDir,
+          state_root: root,
+          experiment: id,
           next_run: state.results.length + 1,
           last_run: jsonlEntry,
-          session: buildSessionSnapshot(state),
+          session: buildSessionSnapshot(ctx, state),
         });
         if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
       }
@@ -2487,7 +3004,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       updateWidget(ctx);
 
       // Refresh fullscreen overlay if open
-      if (overlayTui) overlayTui.requestRender();
+      requestOverlayRender(ctx);
 
       return {
         content: [{ type: "text", text }],
@@ -2611,7 +3128,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let scrollOffset = 0;
       let lastViewportRows = 8;
       let lastTotalRows = 0;
-      overlayTui = tui;
+      claimOverlay(ctx, tui);
 
       spinnerInterval = setInterval(() => {
         spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
@@ -2798,8 +3315,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return cachedLogoDataUrl;
   }
 
-  function readJsonlContent(workDir: string): string {
-    return fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8").trim();
+  function readJsonlContent(workDir: string, experimentId: string | null = null): string {
+    const jsonlPath = autoresearchJsonlPath(workDir, experimentId);
+    try {
+      return fs.readFileSync(jsonlPath, "utf-8").trim();
+    } catch {
+      // The log can be created between the export pre-check and here, and a
+      // missing file just means an empty dashboard.
+      return "";
+    }
   }
 
   function escapeHtml(text: string): string {
@@ -2820,6 +3344,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   let dashboardServerPort: number | null = null;
   let dashboardServerWorkDir: string | null = null;
   let dashboardServerHtmlPath: string | null = null;
+  /** Session that started the export server; only it may stop it. */
+  let dashboardServerSessionKey: string | null = null;
+  /** Exact log file the running server streams, so it can never serve a sibling's. */
+  let dashboardServerJsonlPath: string | null = null;
   const dashboardSseClients = new Set<ServerResponse>();
 
   function openInBrowser(url: string): void {
@@ -2853,11 +3381,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     dashboardServerPort = null;
     dashboardServerWorkDir = null;
     dashboardServerHtmlPath = null;
+    dashboardServerSessionKey = null;
+    dashboardServerJsonlPath = null;
   }
 
-  function writeDashboardFile(workDir: string): string {
-    const jsonlContent = readJsonlContent(workDir);
-    const sessionName = extractAutoresearchSessionName(jsonlContent);
+  function writeDashboardFile(workDir: string, experimentId: string | null): string {
+    const jsonlContent = readJsonlContent(workDir, experimentId);
+    const sessionName = extractAutoresearchSessionName(jsonlContent, experimentId);
     const html = injectDataIntoTemplate(readTemplate(), sessionName)
       .replace(LOGO_PLACEHOLDER, logoDataUrl());
     const exportDir = fs.mkdtempSync(path.join(tmpdir(), "pi-autoresearch-dashboard-"));
@@ -2881,9 +3411,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return CONTENT_TYPES[ext] ?? "application/octet-stream";
   }
 
-  function resolveServedFile(workDir: string, requestPath: string): string | null {
+  function resolveServedFile(requestPath: string): string | null {
     if (requestPath === "/") return dashboardServerHtmlPath;
-    if (requestPath === "/autoresearch.jsonl") return autoresearchJsonlPath(workDir);
+    if (requestPath === "/autoresearch.jsonl") return dashboardServerJsonlPath;
     return null;
   }
 
@@ -2898,8 +3428,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     res.on("close", () => dashboardSseClients.delete(res));
   }
 
-  function broadcastDashboardUpdate(workDir: string): void {
-    if (!dashboardServer || dashboardServerWorkDir !== workDir) return;
+  function broadcastDashboardUpdate(jsonlPath: string): void {
+    if (!dashboardServer || dashboardServerJsonlPath !== jsonlPath) return;
     for (const res of dashboardSseClients) {
       try {
         res.write("event: jsonl-updated\n");
@@ -2910,19 +3440,28 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   }
 
-  function startStaticServer(workDir: string, dashboardHtmlPath: string): Promise<number> {
+  function startStaticServer(
+    workDir: string,
+    jsonlPath: string,
+    dashboardHtmlPath: string,
+    sessionKey: string,
+  ): Promise<number> {
     return new Promise((resolve, reject) => {
       const resolvedWorkDir = path.resolve(workDir);
+      const resolvedJsonlPath = path.resolve(jsonlPath);
       const resolvedDashboardHtmlPath = path.resolve(dashboardHtmlPath);
 
       if (dashboardServer && dashboardServerWorkDir === resolvedWorkDir && dashboardServerPort) {
         dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+        dashboardServerJsonlPath = resolvedJsonlPath;
+        dashboardServerSessionKey = sessionKey;
         resolve(dashboardServerPort);
         return;
       }
 
       stopDashboardServer();
       dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+      dashboardServerJsonlPath = resolvedJsonlPath;
 
       const server = createServer((req, res) => {
         const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -2932,7 +3471,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           return;
         }
 
-        const filePath = resolveServedFile(resolvedWorkDir, url.pathname);
+        const filePath = resolveServedFile(url.pathname);
         if (!filePath) {
           res.writeHead(404);
           res.end();
@@ -2959,6 +3498,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         dashboardServer = server;
         dashboardServerPort = address.port;
         dashboardServerWorkDir = resolvedWorkDir;
+        dashboardServerSessionKey = sessionKey;
         resolve(address.port);
       });
 
@@ -2967,8 +3507,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   async function exportDashboard(ctx: ExtensionContext): Promise<void> {
-    const workDir = resolveWorkDir(ctx.cwd);
-    const jsonlPath = autoresearchJsonlPath(workDir);
+    const root = stateRoot(ctx);
+    const id = experimentId(ctx);
+    const jsonlPath = autoresearchJsonlPath(root, id);
 
     if (!fs.existsSync(jsonlPath)) {
       ctx.ui.notify(`No ${path.basename(jsonlPath)} found \u2014 run some experiments first`, "error");
@@ -2976,11 +3517,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
 
     try {
-      const dashboardHtmlPath = writeDashboardFile(workDir);
-      const port = await startStaticServer(workDir, dashboardHtmlPath);
+      const dashboardHtmlPath = writeDashboardFile(root, id);
+      const port = await startStaticServer(root, jsonlPath, dashboardHtmlPath, getSessionKey(ctx));
       const url = `http://127.0.0.1:${port}`;
       openInBrowser(url);
-      ctx.ui.notify(`Dashboard at ${url} (live updates)`, "info");
+      ctx.ui.notify(
+        `Dashboard at ${url} (live updates)${id ? ` — experiment ${id}` : ""}`,
+        "info"
+      );
     } catch (error) {
       ctx.ui.notify(
         `Export failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -2990,15 +3534,191 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   // -----------------------------------------------------------------------
+  // Experiment management subcommands
+  // -----------------------------------------------------------------------
+
+  async function listExperimentsCommand(ctx: ExtensionContext): Promise<void> {
+    const root = await resolveRegistryRoot(gitRunner, ctx.cwd);
+    if (!root) {
+      ctx.ui.notify("Not a git repository — no experiment registry here.", "error");
+      return;
+    }
+    const records = listExperiments(root);
+    const bound = experimentId(ctx);
+    if (records.length === 0) {
+      ctx.ui.notify("No experiments yet. Start one with '/autoresearch <goal>' or '/autoresearch new <name>'.", "info");
+      return;
+    }
+    const lines = records.map((r) => {
+      const marker = r.id === bound ? "*" : " ";
+      const when = new Date(r.lastUsedAt).toISOString().slice(0, 16).replace("T", " ");
+      return `${marker} ${r.id.padEnd(20)} ${r.mode.padEnd(9)} ${when}  ${r.name ?? ""}`.trimEnd();
+    });
+    ctx.ui.notify(
+      `Experiments in ${root} (* = this session):\n${lines.join("\n")}`,
+      "info",
+    );
+  }
+
+  /**
+   * Create an experiment and, by default, give it a worktree.
+   *
+   * The session cannot relocate itself — pi's file tools are pinned to the
+   * directory pi was launched in — so a worktree experiment is created for the
+   * *next* session and the user is told exactly where to start it. `--shared`
+   * instead binds this session immediately and relies on scoped git operations.
+   */
+  async function newExperimentCommand(ctx: ExtensionContext, spec: string): Promise<void> {
+    const root = await resolveRegistryRoot(gitRunner, ctx.cwd);
+    if (!root) {
+      ctx.ui.notify("Not a git repository — worktree isolation needs git.", "error");
+      return;
+    }
+
+    const shared = spec.includes("--shared");
+    const name = spec.replace("--shared", "").trim();
+    if (!name) {
+      ctx.ui.notify("Usage: /autoresearch new <name> [--shared]", "error");
+      return;
+    }
+
+    if (getRuntime(ctx).autoresearchMode) {
+      ctx.ui.notify("Turn autoresearch off before switching experiments: '/autoresearch off'", "error");
+      return;
+    }
+
+    const id = uniqueId(readRegistry(root), name);
+
+    if (shared) {
+      const record = createExperiment(root, { name, mode: "shared", workDir: resolveWorkDir(ctx.cwd) });
+      bindExperiment(ctx, root, record.id);
+      await reconstructState(ctx);
+      ctx.ui.notify(
+        `Created shared experiment "${record.id}" and bound this session to it.\n` +
+        `State: .auto/experiments/${record.id}/\n` +
+        "Commits and discards are scoped to the files this experiment changed.",
+        "info",
+      );
+      return;
+    }
+
+    const created = await createWorktree(gitRunner, root, id);
+    if (!created.ok) {
+      ctx.ui.notify(`Could not create worktree: ${created.error}`, "error");
+      return;
+    }
+
+    const record = createExperiment(root, {
+      id,
+      name,
+      mode: "worktree",
+      workDir: created.workDir,
+      branch: branchFor(id),
+    });
+
+    ctx.ui.notify(
+      `Created worktree experiment "${record.id}".\n` +
+      `  Branch: ${record.branch}\n` +
+      `  Worktree: ${created.workDir}\n` +
+      `  State: .auto/experiments/${record.id}/\n\n` +
+      "Start a new session inside it so its edits, commits and discards are fully isolated:\n" +
+      `  cd ${created.workDir} && pi\n` +
+      "It binds itself automatically — no further command needed.",
+      "info",
+    );
+  }
+
+  async function joinExperimentCommand(ctx: ExtensionContext, rawId: string): Promise<void> {
+    const root = await resolveRegistryRoot(gitRunner, ctx.cwd);
+    if (!root) {
+      ctx.ui.notify("Not a git repository — no experiment registry here.", "error");
+      return;
+    }
+
+    const wanted = rawId.trim();
+    if (!wanted) {
+      ctx.ui.notify("Usage: /autoresearch join <experiment-id>", "error");
+      return;
+    }
+
+    const record = getExperiment(root, wanted) ?? listExperiments(root).find((r) => r.id.includes(wanted));
+    if (!record) {
+      ctx.ui.notify(`No experiment matching "${wanted}". Try '/autoresearch list'.`, "error");
+      return;
+    }
+
+    if (record.mode === "worktree" && !samePath(ctx.cwd, record.workDir)) {
+      ctx.ui.notify(
+        `Experiment "${record.id}" runs in its own worktree and this session is in ${ctx.cwd}.\n` +
+        "Start pi inside the worktree so its file tools operate there:\n" +
+        `  cd ${record.workDir} && pi`,
+        "error",
+      );
+      return;
+    }
+
+    bindExperiment(ctx, root, record.id);
+    await reconstructState(ctx);
+    ctx.ui.notify(
+      `Joined experiment "${record.id}" (${record.mode}). ${getRuntime(ctx).state.results.length} run(s) loaded.`,
+      "info",
+    );
+  }
+
+  async function dropExperimentCommand(ctx: ExtensionContext, rawId: string): Promise<void> {
+    const root = await resolveRegistryRoot(gitRunner, ctx.cwd);
+    if (!root) {
+      ctx.ui.notify("Not a git repository — no experiment registry here.", "error");
+      return;
+    }
+
+    const wanted = rawId.trim();
+    if (!wanted) {
+      ctx.ui.notify("Usage: /autoresearch drop <experiment-id>", "error");
+      return;
+    }
+
+    // Drop is destructive, so it needs an exact id — a fuzzy match could
+    // remove the wrong experiment's worktree.
+    const record = getExperiment(root, wanted);
+    if (!record) {
+      const known = listExperiments(root).map((r) => r.id).join(", ") || "none";
+      ctx.ui.notify(`No experiment with id "${wanted}". Available: ${known}`, "error");
+      return;
+    }
+
+    const removed = await removeWorktree(gitRunner, root, record);
+    deleteExperiment(root, record.id);
+    try {
+      fs.rmSync(experimentDir(root, record.id), { recursive: true, force: true });
+    } catch {
+      // Losing the state directory is not worth blocking the drop.
+    }
+
+    if (experimentId(ctx) === record.id) {
+      getRuntime(ctx).experimentId = null;
+      getRuntime(ctx).state = createExperimentState();
+      updateWidget(ctx);
+    }
+
+    ctx.ui.notify(
+      removed.ok
+        ? `Dropped experiment "${record.id}" and removed its worktree and state.`
+        : `Dropped experiment "${record.id}" from the registry, but its worktree could not be removed: ${removed.error}`,
+      removed.ok ? "info" : "error",
+    );
+  }
+
+  // -----------------------------------------------------------------------
   // /autoresearch command — enter autoresearch mode
   // -----------------------------------------------------------------------
 
   function turnAutoresearchOff(ctx: ExtensionContext): void {
     const runtime = getRuntime(ctx);
     const wasRunning = !ctx.isIdle();
-    const workDir = resolveWorkDir(ctx.cwd);
+    const workDir = codeDir(ctx);
 
-    recordAutoresearchActivation(workDir, false);
+    recordAutoresearchActivation(ctx, workDir, false);
     setAutoresearchMode(ctx, false);
     runtime.autoResumeTurns = 0;
     runtime.experimentsThisSession = 0;
@@ -3006,7 +3726,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
     cancelPendingResume(runtime);
-    stopDashboardServer();
+    if (dashboardServerSessionKey === getSessionKey(ctx)) stopDashboardServer();
     clearSessionUi(ctx);
     if (wasRunning) ctx.abort();
     ctx.ui.notify(
@@ -3043,9 +3763,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "clear") {
-        const workDir = resolveWorkDir(ctx.cwd);
-        const jsonlPaths = sessionFileCandidates(workDir, "log");
-        recordAutoresearchActivation(workDir, false);
+        const root = stateRoot(ctx);
+        const id = experimentId(ctx);
+        const jsonlPaths = sessionFileCandidates(root, "log", id);
+        const workDir = codeDir(ctx);
+        recordAutoresearchActivation(ctx, workDir, false);
         setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
@@ -3054,7 +3776,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.runningExperiment = null;
         cancelPendingResume(runtime);
         runtime.state = createExperimentState();
-        stopDashboardServer();
+        if (dashboardServerSessionKey === getSessionKey(ctx)) stopDashboardServer();
         updateWidget(ctx);
 
         const deletedPaths: string[] = [];
@@ -3062,21 +3784,42 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           if (!fs.existsSync(jsonlPath)) continue;
           try {
             fs.unlinkSync(jsonlPath);
-            deletedPaths.push(path.relative(workDir, jsonlPath) || path.basename(jsonlPath));
+            deletedPaths.push(path.relative(root, jsonlPath) || path.basename(jsonlPath));
           } catch (error) {
             ctx.ui.notify(
-              `Failed to delete ${path.relative(workDir, jsonlPath) || path.basename(jsonlPath)}: ${error instanceof Error ? error.message : String(error)}`,
+              `Failed to delete ${path.relative(root, jsonlPath) || path.basename(jsonlPath)}: ${error instanceof Error ? error.message : String(error)}`,
               "error"
             );
             return;
           }
         }
 
+        const scope = id ? `experiment ${id}` : "this session";
         if (deletedPaths.length > 0) {
-          ctx.ui.notify(`Deleted ${deletedPaths.join(", ")} and turned autoresearch mode OFF`, "info");
+          ctx.ui.notify(`Deleted ${deletedPaths.join(", ")} for ${scope} and turned autoresearch mode OFF`, "info");
         } else {
-          ctx.ui.notify("No session log found. Autoresearch mode OFF", "info");
+          ctx.ui.notify(`No session log found for ${scope}. Autoresearch mode OFF`, "info");
         }
+        return;
+      }
+
+      if (command === "list" || command === "ls") {
+        await listExperimentsCommand(ctx);
+        return;
+      }
+
+      if (command === "new" || command.startsWith("new ")) {
+        await newExperimentCommand(ctx, trimmedArgs.slice(3).trim());
+        return;
+      }
+
+      if (command === "join" || command.startsWith("join ")) {
+        await joinExperimentCommand(ctx, trimmedArgs.slice(4).trim());
+        return;
+      }
+
+      if (command === "drop" || command.startsWith("drop ")) {
+        await dropExperimentCommand(ctx, trimmedArgs.slice(4).trim());
         return;
       }
 
@@ -3085,12 +3828,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const workDir = resolveWorkDir(ctx.cwd);
-      recordAutoresearchActivation(workDir, true);
+      // Entering the loop implies a claim on an experiment, so the first turn
+      // already has somewhere private to write.
+      const { root, record } = await ensureExperiment(ctx);
+      const workDir = codeDir(ctx);
+      recordAutoresearchActivation(ctx, workDir, true);
       setAutoresearchMode(ctx, true);
       runtime.autoResumeTurns = 0;
       const rulesLoaded = hasAutoresearchRules(ctx);
-      // No .auto/prompt.md yet — load the create skill so the agent follows the
+      // No prompt.md yet — load the create skill so the agent follows the
       // setup guidelines. `/skill:<name>` is expanded to the full SKILL.md when
       // sent with `expandPromptTemplates` (see sendWhenReady), and trailing args
       // are appended as the session goal. Must be sent as its own message that
@@ -3100,19 +3846,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         : `/skill:autoresearch-create ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
 
       ctx.ui.notify(
-        rulesLoaded
-          ? "Autoresearch mode ON — rules loaded from .auto/prompt.md"
-          : "Autoresearch mode ON — no .auto/prompt.md found, loading autoresearch-create skill",
+        `${rulesLoaded
+          ? "Autoresearch mode ON — rules loaded from"
+          : "Autoresearch mode ON — no prompt.md found, loading autoresearch-create skill"}` +
+        ` .auto/experiments/${record.id}/prompt.md. Experiment: ${record.id} (${record.mode}).`,
         "info",
       );
 
       const state = runtime.state;
-      const activationSteer = await fireHook({
+      const activationSteer = await fireHook(ctx, {
         event: "before",
         cwd: workDir,
+        state_root: root,
+        experiment: record.id,
         next_run: state.results.length + 1,
-        last_run: readLastRun(workDir),
-        session: buildSessionSnapshot(state),
+        last_run: readLastRun(ctx),
+        session: buildSessionSnapshot(ctx, state),
       });
 
       // Prepend hook output only when prompt.md exists; otherwise the message

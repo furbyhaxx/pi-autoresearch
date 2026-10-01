@@ -26,6 +26,7 @@ function truncateAtBoundary(buf: Buffer): Buffer {
 export type HookStage = "before" | "after";
 
 export interface SessionSnapshot {
+  experiment: string | null;
   metric_name: string;
   metric_unit: string;
   direction: "lower" | "higher";
@@ -37,7 +38,12 @@ export interface SessionSnapshot {
 
 export interface BeforeHookPayload {
   event: "before";
+  /** Where the hook runs, and where the experiment's code lives. */
   cwd: string;
+  /** Where `.auto/` state lives; the main worktree, which a worktree experiment does not contain. */
+  state_root: string;
+  /** Experiment id, or null for an unbound session. */
+  experiment: string | null;
   next_run: number;
   last_run: Record<string, unknown> | null;
   session: SessionSnapshot;
@@ -46,6 +52,8 @@ export interface BeforeHookPayload {
 export interface AfterHookPayload {
   event: "after";
   cwd: string;
+  state_root: string;
+  experiment: string | null;
   run_entry: Record<string, unknown>;
   session: SessionSnapshot;
 }
@@ -80,7 +88,7 @@ const notFired: HookResult = {
 };
 
 export async function runHook(payload: HookPayload): Promise<HookResult> {
-  const script = hookScriptPath(payload.cwd, payload.event);
+  const script = hookScriptPath(payload.state_root, payload.event, payload.experiment);
   if (!isExecutableFile(script)) return notFired;
 
   const t0 = Date.now();
@@ -143,10 +151,15 @@ export function steerMessageFor(stage: HookStage, result: HookResult): string | 
   return result.stdout.trim() || null;
 }
 
-export function hookLogEntry(stage: HookStage, result: HookResult): Record<string, unknown> {
+export function hookLogEntry(
+  stage: HookStage,
+  result: HookResult,
+  experiment: string | null,
+): Record<string, unknown> {
   return {
     type: "hook",
     stage,
+    ...(experiment ? { experiment } : {}),
     exit_code: result.exitCode,
     duration_ms: result.durationMs,
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
@@ -154,10 +167,10 @@ export function hookLogEntry(stage: HookStage, result: HookResult): Record<strin
   };
 }
 
-function hasConfigHeader(jsonlPath: string): boolean {
+function hasConfigHeader(jsonlPath: string, experiment: string | null): boolean {
   if (!fs.existsSync(jsonlPath)) return false;
   try {
-    return hasAutoresearchConfigHeader(fs.readFileSync(jsonlPath, "utf-8"));
+    return hasAutoresearchConfigHeader(fs.readFileSync(jsonlPath, "utf-8"), experiment);
   } catch {
     return false;
   }
@@ -167,12 +180,13 @@ export function appendHookLogEntryIfConfigured(
   jsonlPath: string,
   stage: HookStage,
   result: HookResult,
+  experiment: string | null = null,
 ): boolean {
   if (!result.fired) return false;
-  if (!hasConfigHeader(jsonlPath)) return false;
+  if (!hasConfigHeader(jsonlPath, experiment)) return false;
 
   try {
-    fs.appendFileSync(jsonlPath, JSON.stringify(hookLogEntry(stage, result)) + "\n");
+    fs.appendFileSync(jsonlPath, JSON.stringify(hookLogEntry(stage, result, experiment)) + "\n");
     return true;
   } catch {
     return false;

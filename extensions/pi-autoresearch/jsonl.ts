@@ -2,6 +2,7 @@ export type JsonlEntry = Record<string, unknown>;
 
 export interface AutoresearchConfigEntry extends JsonlEntry {
   type: "config";
+  experiment?: string;
   name?: string;
   metricName?: string;
   metricUnit?: string;
@@ -150,29 +151,54 @@ export function isAutoresearchRunEntry(entry: unknown): entry is AutoresearchRun
   return isObjectRecord(entry) && typeof entry.run === "number";
 }
 
-function firstConfigEntry(jsonlContent: string): AutoresearchConfigEntry | null {
+/**
+ * Whether an entry belongs to the experiment being reconstructed.
+ *
+ * Entries written before experiments existed carry no id and are treated as
+ * belonging to the unbound session only. An id never matches an absent one, so
+ * concurrent experiments can never read each other's runs.
+ */
+export function entryBelongsToExperiment(entry: JsonlEntry, experimentId: string | null): boolean {
+  const stamped = entry.experiment;
+  if (typeof stamped !== "string" || stamped.length === 0) {
+    return experimentId === null;
+  }
+  return experimentId !== null && stamped === experimentId;
+}
+
+function firstConfigEntry(jsonlContent: string, experimentId: string | null): AutoresearchConfigEntry | null {
   for (const line of nonEmptyLines(jsonlContent)) {
     const entry = parseJsonlEntry(line);
-    if (isAutoresearchConfigEntry(entry)) return entry;
+    if (isAutoresearchConfigEntry(entry) && entryBelongsToExperiment(entry, experimentId)) return entry;
   }
   return null;
 }
 
-export function hasAutoresearchConfigHeader(jsonlContent: string): boolean {
-  return firstConfigEntry(jsonlContent) !== null;
+export function hasAutoresearchConfigHeader(
+  jsonlContent: string,
+  experimentId: string | null = null,
+): boolean {
+  return firstConfigEntry(jsonlContent, experimentId) !== null;
 }
 
-export function extractAutoresearchSessionName(jsonlContent: string): string {
-  return firstConfigEntry(jsonlContent)?.name || "Autoresearch";
+export function extractAutoresearchSessionName(
+  jsonlContent: string,
+  experimentId: string | null = null,
+): string {
+  return firstConfigEntry(jsonlContent, experimentId)?.name || "Autoresearch";
 }
 
-export function reconstructJsonlState(jsonlContent: string): ReconstructedJsonlState {
+export function reconstructJsonlState(
+  jsonlContent: string,
+  experimentId: string | null = null,
+): ReconstructedJsonlState {
   const state = reconstructedState();
   let segment = 0;
 
   for (const line of nonEmptyLines(jsonlContent)) {
     const entry = parseJsonlEntry(line);
     if (!entry) continue;
+    if (!entryBelongsToExperiment(entry, experimentId)) continue;
 
     if (isAutoresearchConfigEntry(entry)) {
       updateConfig(state, entry);

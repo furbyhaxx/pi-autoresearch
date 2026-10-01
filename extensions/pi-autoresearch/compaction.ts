@@ -24,17 +24,23 @@ type StatusCounts = Record<RunStatus, number>;
 
 export interface AutoresearchSummaryPaths {
   workDir: string;
+  /** Experiment whose state this summary covers; null for an unbound session. */
+  experimentId: string | null;
   jsonlPath: string;
   mdPath: string;
   ideasPath: string;
 }
 
-export function autoresearchSummaryPathsFor(workDir: string): AutoresearchSummaryPaths {
+export function autoresearchSummaryPathsFor(
+  workDir: string,
+  experimentId: string | null = null,
+): AutoresearchSummaryPaths {
   return {
     workDir,
-    jsonlPath: sessionFilePath(workDir, "log"),
-    mdPath: sessionFilePath(workDir, "prompt"),
-    ideasPath: sessionFilePath(workDir, "ideas"),
+    experimentId,
+    jsonlPath: sessionFilePath(workDir, "log", experimentId),
+    mdPath: sessionFilePath(workDir, "prompt", experimentId),
+    ideasPath: sessionFilePath(workDir, "ideas", experimentId),
   };
 }
 
@@ -43,7 +49,7 @@ export function autoresearchSummaryPathsFor(workDir: string): AutoresearchSummar
  * Returns a markdown string that is itself the entire compaction summary.
  */
 export function buildAutoresearchCompactionSummary(paths: AutoresearchSummaryPaths): string {
-  const state = loadState(paths.jsonlPath);
+  const state = loadState(paths);
   const sections = [
     headerSection(),
     sessionSection(state),
@@ -55,8 +61,8 @@ export function buildAutoresearchCompactionSummary(paths: AutoresearchSummaryPat
   return sections.filter(Boolean).join("\n\n");
 }
 
-function loadState(jsonlPath: string): ReconstructedJsonlState {
-  return reconstructJsonlState(readFileOrEmpty(jsonlPath));
+function loadState(paths: AutoresearchSummaryPaths): ReconstructedJsonlState {
+  return reconstructJsonlState(readFileOrEmpty(paths.jsonlPath), paths.experimentId);
 }
 
 // ---------------------------------------------------------------------------
