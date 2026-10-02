@@ -62,8 +62,34 @@ Then start the loop inside pi:
 | `/autoresearch new <name> --shared` | Create one in the current checkout, with git operations scoped to this experiment's files. |
 | `/autoresearch join <id>` | Bind this session to an existing experiment. |
 | `/autoresearch drop <id>` | Remove an experiment, its state, and its worktree. |
+| `/autoresearch settings` | Open an editor for the status widget: collapsed vs expanded, height ceiling, metric density and choice, verbose mode. |
 | `/autoresearch export` | Open a live dashboard in your browser. Auto-updates as experiments run. |
-| `/autoresearch dashboard` | Open the fullscreen scrollable dashboard overlay in the terminal. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
+| `/autoresearch dashboard` | Open the fullscreen scrollable dashboard overlay in the terminal. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `e` to expand a result row, `Escape` or `q` to close. |
+
+Tab completes subcommands. For `join` and `drop` it offers the experiment ids from `.auto/experiments.json` directly, so you never have to remember or look one up.
+
+### The status widget
+
+The widget sits above the editor and defaults to a single line:
+
+```
+🔬  [speed-up-app]  81 runs  76 kept  5 discarded  ★ e6_typed_top1 179 #81 +17800%  · /autoresearch dashboard
+```
+
+That is deliberate. A run tracking a few hundred secondary metrics would otherwise print every one of them, wrapping to the terminal width — which does not make the widget shorter, only wider, so it ends up filling half an ultrawide screen and burying the transcript.
+
+`/autoresearch settings` adjusts it, and the same values live under `widget` in `.auto/config.json`:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `collapsed` | `true` | `false` expands the widget to the block below. |
+| `maxHeight` | `8` | Ceiling on widget lines. The terminal's row count can only lower it, never raise it. |
+| `metricsShown` | `4` | How many secondary metrics the expanded widget shows. |
+| `metricMode` | `"auto"` | `auto` ranks by movement since the baseline run, `pinned` uses `pinnedMetrics` in order, `all` shows everything. |
+| `pinnedMetrics` | `[]` | Metric names for `pinned` mode. |
+| `verbose` | `false` | Print every configured metric, ignoring the ceiling. The pre-budget behaviour, kept for large displays. |
+
+Below roughly 54 columns the metric block is dropped entirely rather than truncated into fragments; the line points at the dashboard instead.
 
 **Examples:**
 
@@ -305,6 +331,7 @@ Create `.auto/config.json` in your pi session directory to customize behavior:
 |-------|------|-------------|
 | `workingDir` | string | Override the directory for all autoresearch operations — file I/O, command execution, and git. Supports absolute or relative paths (resolved against the pi session cwd). The config file itself always stays under the session cwd. Fails if the directory doesn't exist. |
 | `maxIterations` | number | Maximum experiments before auto-stopping. The agent is told to stop and won't run more experiments until a new segment is initialized. |
+| `widget` | object | Status widget appearance. See [The status widget](#the-status-widget). |
 
 ### Long-running loops and context
 

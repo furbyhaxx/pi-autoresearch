@@ -507,6 +507,70 @@ function currentResults(results: ExperimentResult[], segment: number): Experimen
 interface AutoresearchConfig {
   maxIterations?: number;
   workingDir?: string;
+  widget?: Partial<WidgetSettings>;
+}
+
+/**
+ * How the transcript widget decides which secondary metrics to show.
+ *
+ * `auto` ranks by movement against the baseline run, which suits a config with
+ * hundreds of metrics where naming them by hand is impractical. It does mean
+ * the row changes between renders. `pinned` uses `pinnedMetrics` in order.
+ */
+type WidgetMetricMode = "auto" | "pinned" | "all";
+
+interface WidgetSettings {
+  /** Start as a single line instead of the expanded block. */
+  collapsed: boolean;
+  /** Ceiling on widget lines. The terminal's row count can only lower it. */
+  maxHeight: number;
+  /** Secondary metrics to show when the widget is expanded. */
+  metricsShown: number;
+  metricMode: WidgetMetricMode;
+  /** Used by `pinned` mode, in display order. */
+  pinnedMetrics: string[];
+  /** Print every configured metric, as before. Ignores the height ceiling. */
+  verbose: boolean;
+}
+
+const DEFAULT_WIDGET_SETTINGS: WidgetSettings = {
+  collapsed: true,
+  maxHeight: 8,
+  metricsShown: 4,
+  metricMode: "auto",
+  pinnedMetrics: [],
+  verbose: false,
+};
+
+function readWidgetSettings(cwd: string, experimentId: string | null = null): WidgetSettings {
+  const raw = readConfig(cwd, experimentId).widget;
+  if (!raw) return { ...DEFAULT_WIDGET_SETTINGS };
+  const mode = raw.metricMode;
+  return {
+    collapsed: typeof raw.collapsed === "boolean" ? raw.collapsed : DEFAULT_WIDGET_SETTINGS.collapsed,
+    maxHeight: typeof raw.maxHeight === "number" && raw.maxHeight > 0
+      ? Math.floor(raw.maxHeight)
+      : DEFAULT_WIDGET_SETTINGS.maxHeight,
+    metricsShown: typeof raw.metricsShown === "number" && raw.metricsShown >= 0
+      ? Math.floor(raw.metricsShown)
+      : DEFAULT_WIDGET_SETTINGS.metricsShown,
+    metricMode: mode === "auto" || mode === "pinned" || mode === "all" ? mode : DEFAULT_WIDGET_SETTINGS.metricMode,
+    pinnedMetrics: Array.isArray(raw.pinnedMetrics)
+      ? raw.pinnedMetrics.filter((m): m is string => typeof m === "string")
+      : [],
+    verbose: typeof raw.verbose === "boolean" ? raw.verbose : DEFAULT_WIDGET_SETTINGS.verbose,
+  };
+}
+
+/**
+ * Never let the widget claim more than a third of the screen, whatever the
+ * configured ceiling says. A 24-row phone window has room for a status line,
+ * not a dashboard.
+ */
+function widgetHeightCeiling(settings: WidgetSettings, terminalRows: number): number {
+  if (settings.collapsed) return 1;
+  if (!Number.isFinite(terminalRows) || terminalRows <= 0) return settings.maxHeight;
+  return Math.max(1, Math.min(settings.maxHeight, Math.floor(terminalRows / 3)));
 }
 
 /** Read the config file (.auto/config.json, legacy autoresearch.config.json) from the given directory (always ctx.cwd) */
@@ -591,6 +655,17 @@ interface AutoresearchActivationEntryData {
   experimentId?: string | null;
   active?: boolean;
 }
+
+export {
+  readWidgetSettings,
+  widgetHeightCeiling,
+  selectDisplayMetrics,
+  rankSecondaryByMovement,
+  renderWidgetSummaryLine,
+  renderDashboardLines,
+  DEFAULT_WIDGET_SETTINGS,
+};
+export type { WidgetSettings, WidgetMetricMode };
 
 export function shouldAutoActivateAutoresearch(
   ctxCwd: string,
@@ -855,12 +930,113 @@ function createRuntimeStore() {
 // Dashboard table renderer (pure function, no UI deps)
 // ---------------------------------------------------------------------------
 
+/**
+ * Rank secondary metrics by how far they moved from the baseline run.
+ *
+ * A metric that started at zero has no meaningful ratio, so any non-zero value
+ * counts as a move and ties fall back to config order to keep the row stable
+ * between renders of the same state.
+ */
+function rankSecondaryByMovement(
+  defs: MetricDef[],
+  current: Record<string, number>,
+  baseline: Record<string, number>
+): MetricDef[] {
+  const moved: { def: MetricDef; score: number }[] = [];
+  for (const def of defs) {
+    const value = current[def.name];
+    if (value === undefined) continue;
+    const base = baseline[def.name];
+    if (base === undefined) continue;
+    const score = base === 0 ? (value === 0 ? 0 : Infinity) : Math.abs((value - base) / base);
+    if (score > 0) moved.push({ def, score });
+  }
+  return moved
+    .sort((a, b) => (b.score === a.score ? 0 : b.score - a.score))
+    .map((m) => m.def);
+}
+
+function selectDisplayMetrics(
+  defs: MetricDef[],
+  current: Record<string, number>,
+  baseline: Record<string, number>,
+  settings: WidgetSettings
+): MetricDef[] {
+  if (settings.metricMode === "all") return defs;
+  if (settings.metricMode === "pinned") {
+    const byName = new Map(defs.map((d) => [d.name, d]));
+    return settings.pinnedMetrics
+      .map((name) => byName.get(name))
+      .filter((d): d is MetricDef => d !== undefined && current[d.name] !== undefined);
+  }
+  return rankSecondaryByMovement(defs, current, baseline).slice(0, settings.metricsShown);
+}
+
+/**
+ * The default one-line readout: how the run is going, not what it is doing.
+ * Everything else lives behind /autoresearch dashboard, which is a surface
+ * built for scrolling through numbers.
+ */
+function renderWidgetSummaryLine(
+  st: ExperimentState,
+  width: number,
+  th: Theme,
+  id: string | null
+): string {
+  const cur = currentResults(st.results, st.currentSegment);
+  const kept = cur.filter((r) => r.status === "keep").length;
+  const discarded = cur.filter((r) => r.status === "discard").length;
+
+  let best: number | null = null;
+  let bestRun = 0;
+  for (let i = st.results.length - 1; i >= 0; i--) {
+    const r = st.results[i];
+    if (r.segment !== st.currentSegment) continue;
+    if (r.status === "keep" && r.metric > 0 && (best === null || isBetter(r.metric, best, st.bestDirection))) {
+      best = r.metric;
+      bestRun = i + 1;
+    }
+  }
+
+  const parts: string[] = [
+    th.fg("accent", "🔬"),
+    th.fg("dim", id ? `[${id}]` : "autoresearch"),
+    th.fg("text", `${st.results.length} run${st.results.length === 1 ? "" : "s"}`),
+    th.fg("success", `${kept} kept`),
+  ];
+  if (discarded > 0) parts.push(th.fg("warning", `${discarded} discarded`));
+
+  if (best !== null) {
+    let metric = `${th.fg("warning", `★ ${st.metricName} ${formatNum(best, st.metricUnit)}`)}`;
+    metric += th.fg("dim", ` #${bestRun}`);
+    const base = st.bestMetric;
+    if (base !== null && base !== 0 && best !== base) {
+      const pct = ((best - base) / base) * 100;
+      const sign = pct > 0 ? "+" : "";
+      const color = isBetter(best, base, st.bestDirection) ? "success" : "error";
+      metric += th.fg(color, ` ${sign}${pct.toFixed(0)}%`);
+    }
+    parts.push(metric);
+  }
+
+  parts.push(th.fg("dim", "· /autoresearch dashboard"));
+  const joined = joinPartsToWidth(
+    parts.map((p, i) => (i === parts.length - 1 ? p : `${p}  `)),
+    Math.max(0, width - 2)
+  );
+  return truncateToWidth(`  ${joined}`, width, "…");
+}
+
 function renderDashboardLines(
   st: ExperimentState,
   width: number,
   th: Theme,
   maxRows: number = 6,
-  headerHints: string[] = []
+  headerHints: string[] = [],
+  settings: WidgetSettings = DEFAULT_WIDGET_SETTINGS,
+  lineCeiling: number = Number.POSITIVE_INFINITY,
+  hitmap?: Map<number, number>,
+  expandedRun: number | null = null
 ): string[] {
   const lines: string[] = [];
 
@@ -942,10 +1118,21 @@ function renderDashboardLines(
     if (st.secondaryMetrics.length > 0) {
       const indent = "            "; // 12 chars to align under progress value
       const maxLineW = width - 2 - indent.length; // 2 for leading "  "
+      // A metric with its delta runs ~35 columns. Below that the name and the
+      // value cannot both survive truncation, so every line would be a
+      // fragment. One honest line beats four unreadable ones.
+      const roomForMetrics = maxLineW >= 40;
+
+      const shown = roomForMetrics
+        ? (settings.verbose
+          ? st.secondaryMetrics
+          : selectDisplayMetrics(st.secondaryMetrics, bestSecondary, baselineSec, settings))
+        : [];
+      const hidden = st.secondaryMetrics.length - shown.length;
 
       // Build individually-colored parts
       const secParts: string[] = [];
-      for (const sm of st.secondaryMetrics) {
+      for (const sm of shown) {
         const val = bestSecondary[sm.name];
         const bv = baselineSec[sm.name];
         if (val !== undefined) {
@@ -960,15 +1147,20 @@ function renderDashboardLines(
         }
       }
 
-      // Flow-wrap parts into lines
+      // Flow-wrap parts into lines, stopping once the line budget is spent
       if (secParts.length > 0) {
         let curLine = "";
         let curVisW = 0;
+        let budgetLeft = settings.verbose
+          ? Number.POSITIVE_INFINITY
+          : Math.max(0, lineCeiling - lines.length - 1);
         for (const part of secParts) {
+          if (budgetLeft <= 0) break;
           const partVisW = visibleWidth(part);
           const sep = curLine ? "  " : "";
           if (curLine && curVisW + sep.length + partVisW > maxLineW) {
             lines.push(truncateToWidth(`  ${th.fg("dim", indent)}${curLine}`, width));
+            budgetLeft--;
             curLine = part;
             curVisW = partVisW;
           } else {
@@ -976,13 +1168,23 @@ function renderDashboardLines(
             curVisW += sep.length + partVisW;
           }
         }
-        if (curLine) {
+        if (curLine && budgetLeft > 0) {
           lines.push(truncateToWidth(`  ${th.fg("dim", indent)}${curLine}`, width));
         }
+      }
+
+      if (hidden > 0 && !settings.verbose && lines.length < lineCeiling) {
+        lines.push(
+          truncateToWidth(
+            `  ${th.fg("dim", `${hidden} metric${hidden === 1 ? "" : "s"} — /autoresearch dashboard`)}`,
+            width
+          )
+        );
       }
     }
   }
 
+  const tableStart = lines.length;
   lines.push("");
 
   // Determine visible rows once — used for both column sizing and rendering
@@ -1147,6 +1349,33 @@ function renderDashboardLines(
       `${th.fg("muted", r.description.slice(0, descW))}`;
 
     lines.push(truncateToWidth(rowLine, width));
+    hitmap?.set(lines.length - 1, i);
+
+    // Only the fullscreen dashboard expands a row; the transcript widget would
+    // blow its height budget on the first click.
+    if (expandedRun !== null && i === expandedRun) {
+      const detail = Object.entries(r.metrics ?? {}).filter(([, v]) => typeof v === "number");
+      for (let d = 0; d < detail.length; d += 3) {
+        const chunk = detail.slice(d, d + 3).map(([n, v]) => `${n}: ${formatNum(v as number, "")}`);
+        lines.push(truncateToWidth(`      ${th.fg("dim", chunk.join("  "))}`, width));
+      }
+      if (detail.length === 0) {
+        lines.push(truncateToWidth(`      ${th.fg("dim", "no secondary metrics recorded")}`, width));
+      }
+    }
+  }
+
+  // The ceiling binds the whole block, not just the metric run. The results
+  // table goes first: it is a scrollable surface's job, and in a transcript
+  // widget the summary is what you actually read.
+  if (!settings.verbose && Number.isFinite(lineCeiling) && lines.length > lineCeiling) {
+    const keep = Math.max(0, lineCeiling - 1);
+    const overflow = lines.length - keep;
+    if (overflow < lines.length - tableStart) {
+      lines.splice(tableStart, overflow);
+    } else {
+      lines.length = keep;
+    }
   }
 
   return lines;
@@ -1184,6 +1413,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const result = await pi.exec("git", args, { cwd, timeout: timeoutMs });
     return { code: result.code, stdout: result.stdout, stderr: result.stderr };
   };
+
+  // pi hands completions no context, so the only way to know which checkout the
+  // user is completing against is the cwd of the last command they ran.
+  let lastCommandCwd: string | null = null;
 
   /** Main worktree holding the registry and every `.auto/` state file. */
   const stateRoot = (ctx: ExtensionContext): string => getRuntime(ctx).stateRoot ?? ctx.cwd;
@@ -1756,7 +1989,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|export|dashboard|list|new|join|drop|<text>]",
+      "Usage: /autoresearch [off|clear|export|dashboard|list|new|join|drop|settings|<text>]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "  A session that has not claimed an experiment gets its own on first use.",
@@ -1770,6 +2003,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "new <name> --shared creates one in this checkout, with scoped git operations.",
       "join <id> binds this session to an existing experiment.",
       "drop <id> removes an experiment, its state, and its worktree.",
+      "settings opens an editor for the status widget's size, density and metric choice.",
+      "",
+      "Tab completes subcommands, and for join/drop it offers the live experiment ids.",
 
       "",
       "Running two experiments at once? Give each its own worktree:",
@@ -1927,7 +2163,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Full dashboard table rendered as widget
     ctx.ui.setWidget("autoresearch", (tui, theme) => ({
         render(width: number): string[] {
-          const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+          const size = getTuiSize(tui);
+          const safeWidth = Math.max(1, width || size.width);
+          const settings = readWidgetSettings(stateRoot(ctx), experimentId(ctx));
+          const ceiling = widgetHeightCeiling(settings, size.height);
+
+          if (settings.collapsed && !settings.verbose) {
+            return [renderWidgetSummaryLine(state, safeWidth, theme, id)];
+          }
+
           const title = truncateDisplayText(
             `🔬 autoresearch${id ? ` [${id}]` : ""}${state.name ? `: ${state.name}` : ""}`,
             Math.max(0, safeWidth - 5)
@@ -1935,7 +2179,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const fillLen = Math.max(0, safeWidth - 3 - 1 - visibleWidth(title) - 1);
           const rows = safeWidth < 95 ? 4 : 6;
 
-          return [
+          const header = [
             truncateToWidth(
               theme.fg("borderMuted", "───") +
                 theme.fg("accent", ` ${title} `) +
@@ -1944,14 +2188,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               "…",
               true
             ),
-            ...renderDashboardLines(
-              state,
-              safeWidth,
-              theme,
-              rows,
-              dashboardHintVariants()
-            ),
           ];
+
+          // verbose is an explicit opt-in to the pre-budget wall of numbers
+          if (settings.verbose) {
+            return [...header, ...renderDashboardLines(state, safeWidth, theme, rows, dashboardHintVariants(), settings)];
+          }
+
+          return [
+            ...header,
+            ...renderDashboardLines(state, safeWidth, theme, rows, dashboardHintVariants(), settings, ceiling),
+          ].slice(0, ceiling);
         },
         invalidate(): void {},
       }));
@@ -3128,6 +3375,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let scrollOffset = 0;
       let lastViewportRows = 8;
       let lastTotalRows = 0;
+      // Line offset of the content the viewport currently starts at, so a click
+      // can be mapped back to the result it landed on.
+      let firstVisibleLine = 0;
+      let expandedRun: number | null = null;
+      const rowHitmap = new Map<number, number>();
       claimOverlay(ctx, tui);
 
       spinnerInterval = setInterval(() => {
@@ -3136,7 +3388,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }, 80);
 
       const buildOverlayContent = (renderWidth: number): string[] => {
-        const content = renderDashboardLines(state, renderWidth, theme, 0);
+        rowHitmap.clear();
+        const content = renderDashboardLines(state, renderWidth, theme, 0, [], readWidgetSettings(stateRoot(ctx), experimentId(ctx)), Number.POSITIVE_INFINITY, rowHitmap, expandedRun);
         if (runtime.runningExperiment) {
           const elapsed = formatElapsed(Date.now() - runtime.runningExperiment.startedAt);
           const frame = SPINNER[spinnerFrame % SPINNER.length];
@@ -3190,6 +3443,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           out.push(boxRow(` ${theme.fg("accent", title)}`));
 
           const visible = content.slice(scrollOffset, scrollOffset + viewportRows);
+          firstVisibleLine = scrollOffset;
           for (const line of visible) out.push(boxRow(line));
           for (let i = visible.length; i < viewportRows; i++) out.push(boxRow(""));
 
@@ -3197,8 +3451,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             ? ` ${scrollOffset + 1}-${Math.min(scrollOffset + viewportRows, totalRows)}/${totalRows}`
             : "";
           const helpText = safeWidth >= 85
-            ? ` ↑↓/j/k scroll • pgup/pgdn • g/G • esc close${scrollInfo} `
-            : ` j/k scroll • esc close${scrollInfo} `;
+            ? ` ↑↓/j/k scroll • e expand row • pgup/pgdn • g/G • esc close${scrollInfo} `
+            : ` j/k scroll • e expand row • esc close${scrollInfo} `;
           const footFill = Math.max(0, safeWidth - 2 - visibleWidth(helpText));
 
           out.push(
@@ -3232,8 +3486,37 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             scrollOffset = 0;
           } else if (data === "G") {
             scrollOffset = maxScroll;
+          } else if (data === "e" || data === " ") {
+            // Keyboard twin of the click: toggle the first visible result row.
+            for (const [line, run] of rowHitmap) {
+              if (line >= firstVisibleLine && line < firstVisibleLine + lastViewportRows) {
+                expandedRun = expandedRun === run ? null : run;
+                break;
+              }
+            }
           }
           tui.requestRender();
+        },
+
+        handleMouse(event: { type: string; button: string; y: number; wheelDelta?: number }): { handled?: boolean } {
+          const maxScroll = Math.max(0, lastTotalRows - lastViewportRows);
+          if (event.type === "wheel" || event.wheelDelta !== undefined) {
+            const delta = event.wheelDelta ?? 0;
+            if (delta !== 0) {
+              scrollOffset = Math.max(0, Math.min(maxScroll, scrollOffset + (delta > 0 ? 1 : -1) * 3));
+              tui.requestRender();
+            }
+            return { handled: true };
+          }
+          if (event.type === "click" && event.button === "left") {
+            // Row 0 and 1 are the box border and title; content starts at 3.
+            const run = rowHitmap.get(firstVisibleLine + (event.y - 3));
+            if (run === undefined) return {};
+            expandedRun = expandedRun === run ? null : run;
+            tui.requestRender();
+            return { handled: true };
+          }
+          return {};
         },
 
         invalidate(): void {},
@@ -3735,9 +4018,181 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     );
   }
 
+  const SUBCOMMANDS: { value: string; label: string; description: string }[] = [
+    { value: "list", label: "list", description: "Show every registered experiment" },
+    { value: "new", label: "new <name>", description: "Create an experiment (worktree by default, --shared optional)" },
+    { value: "join", label: "join <id>", description: "Attach this session to an existing experiment" },
+    { value: "drop", label: "drop <id>", description: "Remove an experiment, its worktree and its state" },
+    { value: "dashboard", label: "dashboard", description: "Open the fullscreen dashboard" },
+    { value: "export", label: "export", description: "Open the browser dashboard" },
+    { value: "clear", label: "clear", description: "Delete this experiment's log" },
+    { value: "off", label: "off", description: "Turn autoresearch mode off" },
+  ];
+
+  /**
+   * Completing an experiment id against the live registry beats a static list:
+   * the ids are generated at runtime and are not guessable.
+   */
+  const experimentIdCompletions = async (prefix: string) => {
+    const root = await resolveRegistryRoot(gitRunner, lastCommandCwd ?? process.cwd());
+    if (!root) return null;
+    return listExperiments(root)
+      .filter((r) => r.id.startsWith(prefix))
+      .map((r) => ({
+        value: r.id,
+        label: r.id,
+        description: [
+          r.mode,
+          r.name,
+          r.resultCount === 0 ? "no results yet" : `${r.resultCount} results`,
+        ].filter(Boolean).join(" · "),
+      }));
+  };
+
+  /**
+   * Interactive editor for the widget settings. Persists straight to the
+   * experiment's config.json so the change survives a restart.
+   *
+   * Rendered as a fullscreen component so it can take both keyboard and mouse
+   * input: the transcript widget gets neither, which is deliberate.
+   */
+  async function openWidgetSettings(ctx: ExtensionContext): Promise<void> {
+    const root = stateRoot(ctx);
+    const id = experimentId(ctx);
+    const configPath = autoresearchConfigPath(root, id);
+    let settings = readWidgetSettings(root, id);
+    let cursor = 0;
+
+    const persist = (): void => {
+      try {
+        fs.mkdirSync(path.dirname(configPath), { recursive: true });
+        let existing: Record<string, unknown> = {};
+        if (fs.existsSync(configPath)) {
+          try {
+            existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+          } catch {
+            existing = {};
+          }
+        }
+        fs.writeFileSync(configPath, JSON.stringify({ ...existing, widget: settings }, null, 2) + "\n");
+        updateWidget(ctx);
+      } catch (error) {
+        ctx.ui.notify(`Could not save settings: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    };
+
+    const adjust = (delta: number, min: number, max: number): void => {
+      settings = { ...settings, maxHeight: Math.max(min, Math.min(max, settings.maxHeight + delta)) };
+    };
+
+    await ctx.ui.custom<void>(
+      (tui, theme, _keybindings, done) => {
+        const on = (label: string, value: string, active: boolean): string =>
+          `  ${active ? theme.fg("accent", "▸") : " "} ${label.padEnd(22)} ${theme.fg(active ? "warning" : "muted", value)}`;
+
+        const cycleMode = (): void => {
+          const order: WidgetMetricMode[] = ["auto", "pinned", "all"];
+          settings = { ...settings, metricMode: order[(order.indexOf(settings.metricMode) + 1) % order.length] };
+        };
+
+        const rows = (): { label: string; value: string; active: boolean }[] => [
+          { label: "Collapsed by default", value: settings.collapsed ? "on" : "off", active: settings.collapsed },
+          { label: "Max height", value: `${settings.maxHeight} lines`, active: false },
+          { label: "Metrics shown", value: String(settings.metricsShown), active: false },
+          { label: "Metric choice", value: settings.metricMode, active: false },
+          { label: "Verbose (all metrics)", value: settings.verbose ? "on" : "off", active: settings.verbose },
+        ];
+
+        const activate = (): void => {
+          switch (cursor) {
+            case 0: settings = { ...settings, collapsed: !settings.collapsed }; break;
+            case 1: adjust(1, 2, 40); break;
+            case 2:
+              settings = { ...settings, metricsShown: settings.metricsShown >= 12 ? 0 : settings.metricsShown + 2 };
+              break;
+            case 3: cycleMode(); break;
+            case 4: settings = { ...settings, verbose: !settings.verbose }; break;
+          }
+          persist();
+          tui.requestRender();
+        };
+
+        return {
+          render(width: number): string[] {
+            const safeWidth = Math.max(20, width);
+            const inner = safeWidth - 2;
+            const border = (t: string) => theme.fg("border", t);
+            const row = (line: string): string => {
+              const clipped = truncateToWidth(line, inner, "…", true);
+              return border("│") + clipped + " ".repeat(Math.max(0, inner - visibleWidth(clipped))) + border("│");
+            };
+            const out = [border(`╭${"─".repeat(inner)}╮`), row(` ${theme.fg("accent", "autoresearch settings")}`)];
+            for (const [i, r] of rows().entries()) out.push(row(on(r.label, r.value, i === cursor)));
+            if (settings.metricMode === "auto") {
+              out.push(row(` ${theme.fg("dim", "shows the metrics that moved most since the baseline run")}`));
+            }
+            out.push(row(""));
+            out.push(row(
+              ` ${theme.fg("muted", "↑↓ move")}  ${theme.fg("muted", "enter/click toggle")}  ` +
+              `${theme.fg("muted", "←→ adjust")}  ${theme.fg("muted", "esc close")}`
+            ));
+            out.push(border(`╰${"─".repeat(inner)}╯`));
+            return out;
+          },
+
+          handleInput(data: string): void {
+            const last = rows().length - 1;
+            if (matchesKey(data, "escape") || data === "q") { done(undefined); return; }
+            if (matchesKey(data, "up") || data === "k") cursor = Math.max(0, cursor - 1);
+            else if (matchesKey(data, "down") || data === "j") cursor = Math.min(last, cursor + 1);
+            else if (data === "\r" || data === "\n") activate();
+            else if (matchesKey(data, "left") || data === "h") { cursor = Math.max(0, cursor - 1); }
+            else if (matchesKey(data, "right") || data === "l") { cursor = Math.min(last, cursor + 1); }
+          },
+
+          handleMouse(event: { type: string; button: string; y: number; x: number }): { handled?: boolean } {
+            if (event.type !== "click" || event.button !== "left") return {};
+            // Rows start on the line after the box border and the title.
+            // rows() builds fresh objects, so it must be called once here:
+            // a second call would make indexOf miss on reference identity.
+            const all = rows();
+            const hit = all[event.y - 2];
+            if (!hit) return {};
+            cursor = all.indexOf(hit);
+            activate();
+            return { handled: true };
+          },
+
+          invalidate(): void {},
+
+          dispose(): void {},
+        };
+      },
+      { overlay: true, overlayOptions: { width: Math.min(64, 80), anchor: "center" } }
+    );
+  }
+
   pi.registerCommand("autoresearch", {
     description: "Start, stop, clear, export, or open dashboards for autoresearch mode",
+    getArgumentCompletions: async (argumentPrefix) => {
+      const trimmed = argumentPrefix.trimStart();
+      const spaceAt = trimmed.indexOf(" ");
+
+      if (spaceAt === -1) {
+        return SUBCOMMANDS.filter((s) => s.value.startsWith(trimmed.toLowerCase()));
+      }
+
+      const sub = trimmed.slice(0, spaceAt).toLowerCase();
+      const rest = trimmed.slice(spaceAt + 1).trimStart();
+
+      if (sub === "join" || sub === "drop") return experimentIdCompletions(rest);
+      if (sub === "new" && (rest.split(/\s+/).pop() ?? "").startsWith("-")) {
+        return [{ value: "--shared", label: "--shared", description: "Run in this checkout instead of a new worktree" }];
+      }
+      return null;
+    },
     handler: async (args, ctx) => {
+      lastCommandCwd = ctx.cwd;
       const runtime = getRuntime(ctx);
       const trimmedArgs = (args ?? "").trim();
       const command = trimmedArgs.toLowerCase();
@@ -3820,6 +4275,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (command === "drop" || command.startsWith("drop ")) {
         await dropExperimentCommand(ctx, trimmedArgs.slice(4).trim());
+        return;
+      }
+
+      if (command === "settings" || command === "config") {
+        await openWidgetSettings(ctx);
         return;
       }
 

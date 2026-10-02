@@ -12,8 +12,16 @@ All notable changes to this project will be documented in this file.
 - `/autoresearch new <name>` creates an experiment in a dedicated git worktree on branch `autoresearch/<id>`, and prints the `cd … && pi` line needed to start it. A session launched inside a worktree adopts that experiment with no further command.
 - `/autoresearch new <name> --shared` creates an experiment in the current checkout; `/autoresearch list` shows them all with `*` marking the current session's; `/autoresearch join <id>` rebinds; `/autoresearch drop <id>` removes an experiment, its state and its worktree.
 - Hook payloads gained `experiment` and `state_root`, and the compaction summary is built from the bound experiment's paths.
+- **Autocompletion for `/autoresearch`.** `Tab` offers the subcommands, and for `join` and `drop` it reads `.auto/experiments.json` and offers the live experiment ids with their mode, name and result count — ids are generated at runtime and are not guessable.
+- `/autoresearch settings` opens an interactive editor for the status widget: collapsed vs expanded, height ceiling, metric density, which metrics to show, and verbose mode. It writes to the experiment's own `config.json` and leaves the rest of that file untouched.
+- The fullscreen dashboard accepts the mouse: the wheel scrolls, and clicking a result row expands that run's full metric list. `e` does the same from the keyboard.
 
 ### Changed
+
+- **The status widget is bounded, and defaults to a single line.** It previously emitted every configured secondary metric and wrapped them to the terminal width, so a run with a few hundred metrics filled roughly half a 32" ultrawide and made the transcript unreadable. Wrapping changed the shape, not the volume, so a wider terminal never made it shorter. The widget now defaults to one summary line, and when expanded shows at most `widget.maxHeight` lines — further capped by the terminal's row count — with the rest pointed at the dashboard.
+- `widget.metricMode` defaults to `auto`, ranking secondary metrics by movement since the baseline run rather than printing all of them. `pinned` shows a named list in order, `all` shows everything.
+- Below roughly 54 columns the metric block is dropped rather than truncated, since a name and its value cannot both survive the cut.
+- `widget.verbose` restores the previous full output for people who want it on a large display.
 
 - **Git operations in a shared working tree are now scoped instead of repository-wide.** `log_experiment` no longer runs `git add -A` or `git checkout -- .` when other experiments are live in the same checkout: `keep` stages only the files this experiment changed, and `discard` restores only those files. A discard is refused when another experiment moved `HEAD` in the meantime, since the experiment's diff no longer has a meaningful baseline. Mutations are serialized across processes by a lockfile at `.auto/git.lock` that breaks itself if the owning process died.
 - The first result of an experiment in a shared checkout is never committed or reverted automatically. With no prior record of which changes belong to which experiment, the two are indistinguishable and guessing would destroy a sibling's work. The measurement is still logged and the agent is told to stage or revert by hand, or to move to a worktree.
@@ -26,6 +34,7 @@ All notable changes to this project will be documented in this file.
 - `stopDashboardServer()` ran on every session's shutdown, so one session exiting killed the export dashboard another session in the same process was streaming from. The server is now tagged with its owning session and only that session tears it down. The fullscreen overlay and its spinner interval had the same problem and are now tagged too.
 - The export dashboard served a single fixed `log.jsonl` route; it now serves the bound experiment's log.
 - Experiment names and metrics are read per experiment, so a session no longer picks up the name and metric of a sibling experiment's config header.
+- `/autoresearch settings` could not save for anyone without an existing `config.json`, because it never created the `.auto` directory before writing. Clicking a settings row also toggled the row above it, and then toggled nothing at all, because the row list was rebuilt between the lookup and the index search.
 
 ## [1.8.1] - 2026-09-08
 
