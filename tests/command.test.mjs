@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -84,8 +84,32 @@ test("an empty prefix offers every subcommand", async () => {
     const { cmd } = harness(dir);
 
     const values = (await cmd.getArgumentCompletions("")).map((i) => i.value);
-    for (const expected of ["list", "new", "join", "drop", "dashboard", "export", "clear", "off"]) {
+    for (const expected of ["list", "new", "join", "drop", "dashboard", "export", "clear", "settings", "off"]) {
       assert.ok(values.includes(expected), `expected "${expected}" in ${values.join(", ")}`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("every advertised subcommand is one the handler actually accepts", async () => {
+  const dir = makeRepo();
+  try {
+    const { cmd } = harness(dir);
+    const source = readFileSync(new URL("../extensions/pi-autoresearch/index.ts", import.meta.url), "utf-8");
+
+    // The completion list drifted from the dispatch chain once already, so
+    // pin the two together: anything offered must be handled, and the
+    // single-word subcommands handled must be offered.
+    const offered = (await cmd.getArgumentCompletions("")).map((i) => i.value);
+    const handled = [...source.matchAll(/command === "([a-z]+)"/g)].map((m) => m[1]);
+    const unique = [...new Set(handled)].filter((h) => h !== "ls" && h !== "config");
+
+    for (const name of unique) {
+      assert.ok(offered.includes(name), `"${name}" is handled but not offered in completion`);
+    }
+    for (const name of ["settings"]) {
+      assert.ok(unique.includes(name), `"${name}" is offered but the handler does not check for it`);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });

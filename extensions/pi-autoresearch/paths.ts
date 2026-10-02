@@ -116,3 +116,112 @@ export function hookScriptPath(workDir: string, stage: HookStage, experimentId?:
 export function ensureParentDir(filePath: string): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
+
+const MIGRATABLE_KINDS = Object.keys(SESSION_FILE_NAMES) as SessionFileKind[];
+
+export interface FlatStateEntry {
+  from: string;
+  /** Resolved against an experiment id; directories keep their shape. */
+  to: (experimentId: string) => string;
+  isDirectory: boolean;
+}
+
+/**
+ * Flat state files left by a pre-registry version of this extension.
+ *
+ * A repository that only ever ran one experiment has its state directly in
+ * `.auto/`, written before experiments had ids. Claiming an id makes every
+ * lookup resolve under `.auto/experiments/<id>/`, so those files would be
+ * orphaned and the run's history would read as empty. Detecting them here is
+ * what lets the caller adopt them instead of stranding them.
+ *
+ * Anything unrecognised in `.auto/` is left alone: that directory also holds
+ * the registry, the worktree directory and the git lockfile.
+ */
+export function findUnclaimedFlatState(dir: string): FlatStateEntry[] {
+  if (fs.existsSync(path.join(dir, EXPERIMENTS_DIR))) return [];
+
+  const entries: FlatStateEntry[] = [];
+
+  for (const kind of MIGRATABLE_KINDS) {
+    const { current, legacy } = sessionFileCandidates(dir, kind);
+    for (const from of [current, legacy]) {
+      if (fs.existsSync(from)) {
+        entries.push({ from, to: (id) => currentSessionPath(dir, kind, id), isDirectory: false });
+      }
+    }
+  }
+
+  const currentHooks = hooksDir(dir, null);
+  if (fs.existsSync(currentHooks)) {
+    entries.push({
+      from: currentHooks,
+      to: (id) => hooksDir(dir, id),
+      isDirectory: true,
+    });
+  }
+
+  const legacyHooks = path.join(dir, LEGACY_HOOKS_DIR);
+  if (fs.existsSync(legacyHooks)) {
+    entries.push({
+      from: legacyHooks,
+      to: (id) => hooksDir(dir, id),
+      isDirectory: true,
+    });
+  }
+
+  return entries;
+}
+
+/**
+ * Move flat state under an experiment id. Rename first, so a crash part way
+ * through cannot leave a duplicated log; copy is only a fallback for when the
+ * two paths land on different filesystems.
+ */
+export function adoptFlatState(dir: string, experimentId: string): string[] {
+  const adopted: string[] = [];
+  for (const { from, to, isDirectory } of findUnclaimedFlatState(dir)) {
+    const target = to(experimentId);
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      try {
+        fs.renameSync(from, target);
+      } catch {
+        if (!isDirectory) {
+          fs.copyFileSync(from, target);
+          fs.unlinkSync(from);
+        }
+      }
+      adopted.push(target);
+    } catch {
+      // Leave anything we could not move where it is rather than half-copy it.
+    }
+  }
+  return adopted;
+}
+
+/** Best-effort experiment name for a migrated run, taken from its own log. */
+export function nameFromFlatLog(dir: string): string | null {
+  for (const candidate of [path.join(dir, AUTO_DIR, "log.jsonl"), path.join(dir, "autoresearch.jsonl")]) {
+    if (!fs.existsSync(candidate)) continue;
+    try {
+      const handle = fs.openSync(candidate, "r");
+      try {
+        // The config header is the first line, and the log can be large.
+        const buffer = Buffer.alloc(64 * 1024);
+        const read = fs.readSync(handle, buffer, 0, buffer.length, 0);
+        const [firstLine] = buffer.toString("utf-8", 0, read).split("\n");
+        if (!firstLine?.trim()) continue;
+        const parsed = JSON.parse(firstLine) as { type?: string; name?: string };
+        if (parsed.type === "config" && typeof parsed.name === "string" && parsed.name.trim()) {
+          return parsed.name.trim();
+        }
+      } finally {
+        fs.closeSync(handle);
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}

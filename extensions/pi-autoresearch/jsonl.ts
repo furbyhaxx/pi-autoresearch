@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+
 export type JsonlEntry = Record<string, unknown>;
 
 export interface AutoresearchConfigEntry extends JsonlEntry {
@@ -215,4 +217,49 @@ export function reconstructJsonlState(
   }
 
   return state;
+}
+
+/**
+ * Stamp every entry of an adopted log with its experiment id.
+ *
+ * Logs written before experiments had ids carry no `experiment` field, and an
+ * unstamped entry is only visible to an unbound session — so a log migrated
+ * onto disk would still read as empty. Rewritten through a temp file, because
+ * these logs run to hundreds of kilobytes and a crash mid-write must not
+ * truncate the run's history.
+ *
+ * Returns the number of entries stamped.
+ */
+export function stampExperiment(logPath: string, experimentId: string): number {
+  let original: string;
+  try {
+    original = fs.readFileSync(logPath, "utf-8");
+  } catch {
+    return 0;
+  }
+
+  let stamped = 0;
+  const rewritten = original
+    .split("\n")
+    .map((line) => {
+      if (!line.trim()) return line;
+      let parsed: JsonlEntry;
+      try {
+        parsed = JSON.parse(line) as JsonlEntry;
+      } catch {
+        return line;
+      }
+      if (typeof parsed.experiment === "string" && parsed.experiment.length > 0) return line;
+      parsed.experiment = experimentId;
+      stamped++;
+      return JSON.stringify(parsed);
+    })
+    .join("\n");
+
+  if (stamped === 0) return 0;
+
+  const temp = `${logPath}.migrating`;
+  fs.writeFileSync(temp, rewritten);
+  fs.renameSync(temp, logPath);
+  return stamped;
 }

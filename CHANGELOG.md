@@ -15,6 +15,12 @@ All notable changes to this project will be documented in this file.
 - **Autocompletion for `/autoresearch`.** `Tab` offers the subcommands, and for `join` and `drop` it reads `.auto/experiments.json` and offers the live experiment ids with their mode, name and result count — ids are generated at runtime and are not guessable.
 - `/autoresearch settings` opens an interactive editor for the status widget: collapsed vs expanded, height ceiling, metric density, which metrics to show, and verbose mode. It writes to the experiment's own `config.json` and leaves the rest of that file untouched.
 - The fullscreen dashboard accepts the mouse: the wheel scrolls, and clicking a result row expands that run's full metric list. `e` does the same from the keyboard.
+- **Pre-registry runs are adopted automatically.** A repository that only ever ran one experiment has its state flat in `.auto/`. Claiming an experiment id makes every lookup resolve under `.auto/experiments/<id>/`, so those files were orphaned and the run's history read as empty. The first use in such a repository now moves the flat state — and the older `autoresearch.*` names — into the experiment it creates, and reports what it adopted. The experiment id follows the directory, which is short and stable; the display name is read from the run's own log.
+
+### Fixed
+
+- Entries written before experiments had ids carry no `experiment` field, and an unstamped entry is only visible to an unbound session. An adopted log was therefore on disk but still reconstructed as empty, so the migration also stamps every entry it adopts. The rewrite goes through a temp file, because these logs run to hundreds of kilobytes.
+- `/autoresearch settings` was handled by the command but missing from the autocompletion list, so Tab never offered it.
 
 ### Changed
 

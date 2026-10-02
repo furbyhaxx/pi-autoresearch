@@ -47,13 +47,22 @@ import {
   entryBelongsToExperiment,
   extractAutoresearchSessionName,
   reconstructJsonlState,
+  stampExperiment,
 } from "./jsonl.ts";
 import {
   autoresearchSummaryPathsFor,
   buildAutoresearchCompactionSummary,
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts, SHORTCUT_ACTIONS } from "./shortcuts.ts";
-import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import {
+  adoptFlatState,
+  AUTO_DIR,
+  ensureParentDir,
+  findUnclaimedFlatState,
+  nameFromFlatLog,
+  sessionFilePath,
+  sessionFileCandidates,
+} from "./paths.ts";
 import {
   branchFor,
   concurrentExperiments,
@@ -1517,9 +1526,33 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Under the lock so two sessions claiming an experiment for the first time
     // cannot both read the same registry and race each other's write.
     const record = await withGitLock(gitLockPath(root), async () => {
+      // A repository that predates the registry has its run sitting flat in
+      // `.auto/`. Claiming an id would strand that history, so adopt it into
+      // the experiment we are about to create. The id has to exist first.
+      //
+      // The id follows the directory, which is short and stable; the display
+      // name comes from the run's own log, which is what the user actually
+      // called this experiment.
+      const migratedName = nameFromFlatLog(cwd);
+      const id = uniqueId(readRegistry(root), suggestedName ?? path.basename(cwd));
+      const adopted = adoptFlatState(cwd, id);
+      if (adopted.length > 0) {
+        // Entries written before experiments had ids carry no experiment field,
+        // and an unstamped entry is only ever visible to an unbound session.
+        // Without this the history would be adopted on disk but still read as
+        // empty.
+        const logPath = sessionFilePath(cwd, "log", id);
+        if (fs.existsSync(logPath)) stampExperiment(logPath, id);
+        ctx.ui.notify(
+          `Adopted ${adopted.length} pre-existing state file(s) from the old .auto/ layout into experiment "${id}".`,
+          "info"
+        );
+      }
+
       const [head, dirty] = await Promise.all([headSha(gitRunner, cwd), dirtyEntries(gitRunner, cwd)]);
       return createExperiment(root, {
-        name: suggestedName ?? null,
+        id,
+        name: suggestedName ?? migratedName ?? null,
         mode: "shared",
         workDir: cwd,
         branch: null,
@@ -4026,6 +4059,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     { value: "dashboard", label: "dashboard", description: "Open the fullscreen dashboard" },
     { value: "export", label: "export", description: "Open the browser dashboard" },
     { value: "clear", label: "clear", description: "Delete this experiment's log" },
+    { value: "settings", label: "settings", description: "Configure how the status widget looks" },
     { value: "off", label: "off", description: "Turn autoresearch mode off" },
   ];
 
